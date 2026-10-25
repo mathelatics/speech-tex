@@ -89,6 +89,7 @@ typedef struct phonos_model_params {
     int         n_ctx;         /* prompt/context window; 0 => from metadata */
     int         use_mmap;      /* mmap weights when available               */
     int         n_threads;     /* 0 => auto (honors phonos_init hint)       */
+    int         n_ctx_chunk;   /* prefill chunk size; 0 => default (512)  */
 } phonos_model_params;
 
 PHONOS_API phonos_context* phonos_model_load(const phonos_model_params* mp, phonos_status* out_err);

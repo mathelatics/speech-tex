@@ -22,13 +22,6 @@
 #define GGUF_V_MIN   2
 #define GGUF_V_MAX   3
 
-/* array payload: parsed into a flat buffer of element values; only scalar
- * element types supported here (strings-in-arrays handled for tokenizer). */
-struct gguf_array {
-    enum gguf_type elem_type;
-    uint64_t n;
-    void* elems;      /* n * size(elem_type); for STRING: n char* */
-};
 
 /* ---------------- aligned file reader ----------------------------------- */
 struct reader {
@@ -67,7 +60,7 @@ static char* rd_str(struct reader* r) {
     return s;
 }
 
-static void kv_add(struct gguf_file* g, const char* key, enum gguf_type t,
+static void kv_add(struct gguf_file* g, const char* key, enum ph_gguf_type t,
                    const void* data, size_t n_elems) {
     if (g->n_kv >= g->cap_kv) {
         size_t nc = g->cap_kv ? g->cap_kv*2 : 64;
@@ -79,8 +72,8 @@ static void kv_add(struct gguf_file* g, const char* key, enum gguf_type t,
     e->key = key; e->type = t; e->n = n_elems;
     e->data = NULL;
     switch (t) {
-        case GGUF_TYPE_STRING: e->data = (void*)*((const char**)data); break; /* already malloc'd */
-        case GGUF_TYPE_ARRAY:  e->data = (void*)data; break;                  /* ownership transferred */
+        case PH_GGUF_TYPE_STRING: e->data = (void*)*((const char**)data); break; /* already malloc'd */
+        case PH_GGUF_TYPE_ARRAY:  e->data = (void*)data; break;                  /* ownership transferred */
         default: {
             size_t sz = gguf_type_size(t) * (n_elems ? n_elems : 1);
             void* buf = malloc(sz);
@@ -90,32 +83,32 @@ static void kv_add(struct gguf_file* g, const char* key, enum gguf_type t,
     }
 }
 
-/* array payload access via struct gguf_array (declared in header) */
+/* array payload access via struct ph_gguf_array (declared in header) */
 
-static int rd_array(struct reader* r, struct gguf_array* out) {
+static int rd_array(struct reader* r, struct ph_gguf_array* out) {
     uint32_t t = rd_u32(r);
     uint64_t n = rd_u64(r);
-    if (t >= GGUF_TYPE_COUNT) return 0;
-    size_t esz = gguf_type_size((enum gguf_type)t);
+    if (t >= PH_GGUF_TYPE_COUNT) return 0;
+    size_t esz = gguf_type_size((enum ph_gguf_type)t);
     if (n > 0 && (uint64_t)(SIZE_MAX/esz - 1) < n) return 0;   /* overflow guard */
-    out->elem_type = (enum gguf_type)t;
+    out->elem_type = (enum ph_gguf_type)t;
     out->n = n;
     out->elems = calloc(n ? n : 1, esz ? esz : 1);
     if (!out->elems) return 0;
     for (uint64_t i = 0; i < n; i++) {
-        switch ((enum gguf_type)t) {
-            case GGUF_TYPE_UINT8:   rd(r, (uint8_t*)out->elems + i,   1); break;
-            case GGUF_TYPE_INT8:    rd(r, (int8_t*)out->elems + i,    1); break;
-            case GGUF_TYPE_UINT16:  rd(r, (uint16_t*)out->elems + i,  2); break;
-            case GGUF_TYPE_INT16:   rd(r, (int16_t*)out->elems + i,   2); break;
-            case GGUF_TYPE_UINT32:  rd(r, (uint32_t*)out->elems + i,  4); break;
-            case GGUF_TYPE_INT32:   rd(r, (int32_t*)out->elems + i,   4); break;
-            case GGUF_TYPE_FLOAT32: rd(r, (float*)out->elems + i,     4); break;
-            case GGUF_TYPE_BOOL:    rd(r, (int32_t*)out->elems + i,   4); break;
-            case GGUF_TYPE_UINT64:  rd(r, (uint64_t*)out->elems + i,  8); break;
-            case GGUF_TYPE_INT64:   rd(r, (int64_t*)out->elems + i,   8); break;
-            case GGUF_TYPE_FLOAT64: rd(r, (double*)out->elems + i,    8); break;
-            case GGUF_TYPE_STRING: {
+        switch ((enum ph_gguf_type)t) {
+            case PH_GGUF_TYPE_UINT8:   rd(r, (uint8_t*)out->elems + i,   1); break;
+            case PH_GGUF_TYPE_INT8:    rd(r, (int8_t*)out->elems + i,    1); break;
+            case PH_GGUF_TYPE_UINT16:  rd(r, (uint16_t*)out->elems + i,  2); break;
+            case PH_GGUF_TYPE_INT16:   rd(r, (int16_t*)out->elems + i,   2); break;
+            case PH_GGUF_TYPE_UINT32:  rd(r, (uint32_t*)out->elems + i,  4); break;
+            case PH_GGUF_TYPE_INT32:   rd(r, (int32_t*)out->elems + i,   4); break;
+            case PH_GGUF_TYPE_FLOAT32: rd(r, (float*)out->elems + i,     4); break;
+            case PH_GGUF_TYPE_BOOL:    rd(r, (int32_t*)out->elems + i,   4); break;
+            case PH_GGUF_TYPE_UINT64:  rd(r, (uint64_t*)out->elems + i,  8); break;
+            case PH_GGUF_TYPE_INT64:   rd(r, (int64_t*)out->elems + i,   8); break;
+            case PH_GGUF_TYPE_FLOAT64: rd(r, (double*)out->elems + i,    8); break;
+            case PH_GGUF_TYPE_STRING: {
                 char* s = rd_str(r);
                 if (!s) { free(out->elems); out->elems=NULL; return 0; }
                 ((char**)out->elems)[i] = s;
@@ -132,9 +125,9 @@ void gguf_file_free(struct gguf_file* g) {
     if (!g) return;
     for (size_t i = 0; i < g->n_kv; i++) {
         free((void*)g->kvs[i].key);
-        if (g->kvs[i].type == GGUF_TYPE_ARRAY && g->kvs[i].data) {
-            struct gguf_array* a = (struct gguf_array*)g->kvs[i].data;
-            if (a->elem_type == GGUF_TYPE_STRING && a->elems) {
+        if (g->kvs[i].type == PH_GGUF_TYPE_ARRAY && g->kvs[i].data) {
+            struct ph_gguf_array* a = (struct ph_gguf_array*)g->kvs[i].data;
+            if (a->elem_type == PH_GGUF_TYPE_STRING && a->elems) {
                 for (uint64_t j = 0; j < a->n; j++) free(((char**)a->elems)[j]);
             }
             free(a->elems); free(a);
@@ -184,20 +177,20 @@ struct gguf_file* gguf_file_load(const char* path, int prefer_mmap) {
         char* key = rd_str(&r);
         if (!key) break;
         uint32_t t = rd_u32(&r);
-        if (t >= GGUF_TYPE_COUNT) { free(key); break; }
+        if (t >= PH_GGUF_TYPE_COUNT) { free(key); break; }
         char stackval[8];
-        if ((enum gguf_type)t == GGUF_TYPE_STRING) {
+        if ((enum ph_gguf_type)t == PH_GGUF_TYPE_STRING) {
             char* s = rd_str(&r);
             if (!s) { free(key); break; }
-            kv_add(g, key, GGUF_TYPE_STRING, &s, 1);
-        } else if ((enum gguf_type)t == GGUF_TYPE_ARRAY) {
-            struct gguf_array* a = calloc(1, sizeof(*a));
+            kv_add(g, key, PH_GGUF_TYPE_STRING, &s, 1);
+        } else if ((enum ph_gguf_type)t == PH_GGUF_TYPE_ARRAY) {
+            struct ph_gguf_array* a = calloc(1, sizeof(*a));
             if (!a || !rd_array(&r, a)) { free(a); free(key); break; }
-            kv_add(g, key, GGUF_TYPE_ARRAY, a, 1); /* transfers ownership */
+            kv_add(g, key, PH_GGUF_TYPE_ARRAY, a, 1); /* transfers ownership */
         } else {
-            size_t sz = gguf_type_size((enum gguf_type)t);
-            if (sz <= 8) { memset(stackval,0,8); rd(&r, stackval, sz); kv_add(g, key, (enum gguf_type)t, stackval, 1); }
-            else { void* buf = malloc(sz); if (!buf) { free(key); break; } rd(&r, buf, sz); kv_add(g, key, (enum gguf_type)t, buf, 1); free(buf); }
+            size_t sz = gguf_type_size((enum ph_gguf_type)t);
+            if (sz <= 8) { memset(stackval,0,8); rd(&r, stackval, sz); kv_add(g, key, (enum ph_gguf_type)t, stackval, 1); }
+            else { void* buf = malloc(sz); if (!buf) { free(key); break; } rd(&r, buf, sz); kv_add(g, key, (enum ph_gguf_type)t, buf, 1); free(buf); }
         }
     }
 
@@ -299,23 +292,23 @@ const struct gguf_kv* gguf_find(const struct gguf_file* g, const char* key) {
 
 const char* gguf_get_str(const struct gguf_file* g, const char* key) {
     const struct gguf_kv* k = gguf_find(g, key);
-    return (k && k->type == GGUF_TYPE_STRING) ? (const char*)k->data : NULL;
+    return (k && k->type == PH_GGUF_TYPE_STRING) ? (const char*)k->data : NULL;
 }
 
 int64_t gguf_get_int(const struct gguf_file* g, const char* key, int64_t dflt) {
     const struct gguf_kv* k = gguf_find(g, key);
     if (!k || !k->data) return dflt;
     switch (k->type) {
-        case GGUF_TYPE_UINT8:  return *(uint8_t*)k->data;
-        case GGUF_TYPE_INT8:   return *(int8_t*)k->data;
-        case GGUF_TYPE_UINT16: return *(uint16_t*)k->data;
-        case GGUF_TYPE_INT16:  return *(int16_t*)k->data;
-        case GGUF_TYPE_UINT32: return *(uint32_t*)k->data;
-        case GGUF_TYPE_INT32:  return *(int32_t*)k->data;
-        case GGUF_TYPE_UINT64: return (int64_t)*(uint64_t*)k->data;
-        case GGUF_TYPE_INT64:  return *(int64_t*)k->data;
-        case GGUF_TYPE_FLOAT32: return (int64_t)*(float*)k->data;
-        case GGUF_TYPE_BOOL:   return *(int32_t*)k->data;
+        case PH_GGUF_TYPE_UINT8:  return *(uint8_t*)k->data;
+        case PH_GGUF_TYPE_INT8:   return *(int8_t*)k->data;
+        case PH_GGUF_TYPE_UINT16: return *(uint16_t*)k->data;
+        case PH_GGUF_TYPE_INT16:  return *(int16_t*)k->data;
+        case PH_GGUF_TYPE_UINT32: return *(uint32_t*)k->data;
+        case PH_GGUF_TYPE_INT32:  return *(int32_t*)k->data;
+        case PH_GGUF_TYPE_UINT64: return (int64_t)*(uint64_t*)k->data;
+        case PH_GGUF_TYPE_INT64:  return *(int64_t*)k->data;
+        case PH_GGUF_TYPE_FLOAT32: return (int64_t)*(float*)k->data;
+        case PH_GGUF_TYPE_BOOL:   return *(int32_t*)k->data;
         default: return dflt;
     }
 }
@@ -323,12 +316,12 @@ int64_t gguf_get_int(const struct gguf_file* g, const char* key, int64_t dflt) {
 float gguf_get_f32(const struct gguf_file* g, const char* key, float dflt) {
     const struct gguf_kv* k = gguf_find(g, key);
     if (!k || !k->data) return dflt;
-    if (k->type == GGUF_TYPE_FLOAT32) return *(float*)k->data;
-    if (k->type == GGUF_TYPE_FLOAT64) return (float)*(double*)k->data;
+    if (k->type == PH_GGUF_TYPE_FLOAT32) return *(float*)k->data;
+    if (k->type == PH_GGUF_TYPE_FLOAT64) return (float)*(double*)k->data;
     return dflt;
 }
 
-const struct gguf_array* gguf_get_arr(const struct gguf_file* g, const char* key) {
+const struct ph_gguf_array* gguf_get_arr(const struct gguf_file* g, const char* key) {
     const struct gguf_kv* k = gguf_find(g, key);
-    return (k && k->type == GGUF_TYPE_ARRAY) ? (const struct gguf_array*)k->data : NULL;
+    return (k && k->type == PH_GGUF_TYPE_ARRAY) ? (const struct ph_gguf_array*)k->data : NULL;
 }

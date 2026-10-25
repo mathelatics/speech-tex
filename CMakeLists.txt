@@ -61,8 +61,16 @@ file(GLOB PHONOS_SOURCES CONFIGURE_DEPENDS
 add_library(phonos_core STATIC ${PHONOS_SOURCES})
 target_include_directories(phonos_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(phonos_core PUBLIC ggml)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core ${CMAKE_CURRENT_SOURCE_DIR}/src/io
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/model ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/audio)
+find_package(OpenMP QUIET COMPONENTS C)
+if (OpenMP_C_FOUND)
+    target_link_libraries(phonos_core PUBLIC ggml OpenMP::OpenMP_C)
+else()
+    target_link_libraries(phonos_core PUBLIC ggml)
+endif()
 if (MSVC)
     target_compile_options(phonos_core PRIVATE /W3)
 else()

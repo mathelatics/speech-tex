@@ -11,33 +11,33 @@
 extern "C" {
 #endif
 
-enum gguf_type {
-    GGUF_TYPE_UINT8   = 0,
-    GGUF_TYPE_INT8    = 1,
-    GGUF_TYPE_UINT16  = 2,
-    GGUF_TYPE_INT16   = 3,
-    GGUF_TYPE_UINT32  = 4,
-    GGUF_TYPE_INT32   = 5,
-    GGUF_TYPE_FLOAT32 = 6,
-    GGUF_TYPE_BOOL    = 7,
-    GGUF_TYPE_STRING  = 8,
-    GGUF_TYPE_ARRAY   = 9,
-    GGUF_TYPE_UINT64  = 10,
-    GGUF_TYPE_INT64   = 11,
-    GGUF_TYPE_FLOAT64 = 12,
-    GGUF_TYPE_COUNT   = 13,
+enum ph_gguf_type {
+    PH_GGUF_TYPE_UINT8   = 0,
+    PH_GGUF_TYPE_INT8    = 1,
+    PH_GGUF_TYPE_UINT16  = 2,
+    PH_GGUF_TYPE_INT16   = 3,
+    PH_GGUF_TYPE_UINT32  = 4,
+    PH_GGUF_TYPE_INT32   = 5,
+    PH_GGUF_TYPE_FLOAT32 = 6,
+    PH_GGUF_TYPE_BOOL    = 7,
+    PH_GGUF_TYPE_STRING  = 8,
+    PH_GGUF_TYPE_ARRAY   = 9,
+    PH_GGUF_TYPE_UINT64  = 10,
+    PH_GGUF_TYPE_INT64   = 11,
+    PH_GGUF_TYPE_FLOAT64 = 12,
+    PH_GGUF_TYPE_COUNT   = 13,
 };
 
-static inline size_t gguf_type_size(enum gguf_type t) {
-    static const size_t sz[GGUF_TYPE_COUNT] = {1,1,2,2,4,4,4,4,sizeof(void*),0,8,8,8};
-    return t < GGUF_TYPE_COUNT ? sz[t] : 0;
+static inline size_t gguf_type_size(enum ph_gguf_type t) {
+    static const size_t sz[PH_GGUF_TYPE_COUNT] = {1,1,2,2,4,4,4,4,sizeof(void*),0,8,8,8};
+    return t < PH_GGUF_TYPE_COUNT ? sz[t] : 0;
 }
 
-struct gguf_array;  /* defined in .c; opaque here except via accessors */
+struct ph_gguf_array;  /* defined in .c; opaque here except via accessors */
 
 struct gguf_kv {
     const char*     key;
-    enum gguf_type  type;
+    enum ph_gguf_type  type;
     size_t          n;      /* scalar: 1; array: 1 (payload in gguf_array) */
     void*           data;
 };
@@ -80,11 +80,11 @@ const struct gguf_kv*    gguf_find(const struct gguf_file* g, const char* key);
 const char*              gguf_get_str(const struct gguf_file* g, const char* key);
 int64_t                  gguf_get_int(const struct gguf_file* g, const char* key, int64_t dflt);
 float                    gguf_get_f32(const struct gguf_file* g, const char* key, float dflt);
-const struct gguf_array* gguf_get_arr(const struct gguf_file* g, const char* key);
+const struct ph_gguf_array* gguf_get_arr(const struct gguf_file* g, const char* key);
 
 /* array internals exposed to model code (tokenizer vocab etc.) */
-struct gguf_array {
-    enum gguf_type elem_type;
+struct ph_gguf_array {
+    enum ph_gguf_type elem_type;
     uint64_t n;
     void* elems;      /* n * size(elem_type); for STRING: n char* */
 };

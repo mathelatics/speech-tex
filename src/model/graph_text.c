@@ -85,15 +85,15 @@ struct ggml_cgraph* ph_build_graph(struct ggml_context* ctx, const struct ph_hpa
 
     /* rope tables + causal mask are INPUT tensors: the builder only declares
      * shapes; runtime.c fills them after sched alloc. */
-    struct ggml_tensor* cos_t = ggml_new_tensor_2d(ctx, GGML_F32, HD/2, n_tokens);
-    struct ggml_tensor* sin_t = ggml_new_tensor_2d(ctx, GGML_F32, HD/2, n_tokens);
+    struct ggml_tensor* cos_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, HD/2, n_tokens);
+    struct ggml_tensor* sin_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, HD/2, n_tokens);
     ggml_set_name(cos_t, "rope.cos");  ggml_set_input(cos_t);
     ggml_set_name(sin_t, "rope.sin");  ggml_set_input(sin_t);
 
     struct ggml_tensor* x = ggml_get_rows(ctx, w->tok_emb, tokens_in);   /* [E, n] */
 
     /* causal mask [nkv, n]: additive 0 / -1e30 (keys along dim0 to match scores layout) */
-    struct ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_F32, nkv_max, n_tokens);
+    struct ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nkv_max, n_tokens);
     ggml_set_name(mask, "causal.mask"); ggml_set_input(mask);
 
     for (int L = 0; L < hp->n_layers; L++) {
@@ -140,7 +140,7 @@ struct ggml_cgraph* ph_build_graph(struct ggml_context* ctx, const struct ph_hpa
             obuf = ggml_view_2d(ctx, g_merge_scratch, E, n_tokens,
                                 g_merge_scratch->nb[1], 0);
         } else {
-            obuf = ggml_new_tensor_2d(ctx, GGML_F32, E, n_tokens);
+            obuf = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, n_tokens);
         }
         for (int hh = 0; hh < NH && hh < 8; hh++) {
             struct ggml_tensor* dst = ggml_view_2d(ctx, obuf, HD, n_tokens, obuf->nb[1],
@@ -213,11 +213,11 @@ int ph_kv_alloc(struct ph_kv_cache* kv, const struct ph_hparams* hp, int n_ctx, 
     for (int L = 0; L < hp->n_layers; L++) {
         char nm[32];
         snprintf(nm, sizeof nm, "kvcache.k%d", L);
-        kv->k[L] = ggml_new_tensor_2d(kv->ctx, GGML_F32, n_ctx, HD);     /* [NC, HD] */
+        kv->k[L] = ggml_new_tensor_2d(kv->ctx, GGML_TYPE_F32, n_ctx, HD);     /* [NC, HD] */
         ggml_set_name(kv->k[L], nm);
 
         snprintf(nm, sizeof nm, "kvcache.v%d", L);
-        kv->v[L] = ggml_new_tensor_2d(kv->ctx, GGML_F32, n_ctx, HD);
+        kv->v[L] = ggml_new_tensor_2d(kv->ctx, GGML_TYPE_F32, n_ctx, HD);
         ggml_set_name(kv->v[L], nm);
 
         if (host) {

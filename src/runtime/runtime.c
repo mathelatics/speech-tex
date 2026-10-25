@@ -160,7 +160,7 @@ struct engine* engine_load(const struct engine_params* p, phonos_status* err) {
         struct ggml_init_params sp = { .mem_size = 4096, .no_alloc = false };
         e->c_scratch = ggml_init(sp);
         if (!e->c_scratch) { st = PHONOS_ERR_NOMEM; goto fail; }
-        struct ggml_tensor* m = ggml_new_tensor_2d(e->c_scratch, GGML_F32, e->hp.n_embd, e->chunk);
+        struct ggml_tensor* m = ggml_new_tensor_2d(e->c_scratch, GGML_TYPE_F32, e->hp.n_embd, e->chunk);
         ggml_set_name(m, "attn.merge");
         ggml_backend_buffer_t mb = ggml_backend_alloc_buffer(e->be_cpu, ggml_nbytes(m));
         if (!mb) { st = PHONOS_ERR_NOMEM; goto fail; }
@@ -228,10 +228,14 @@ static const float* run_step(struct engine* e, const int* tokens, int n,
                                                   tin, n, pos_begin, logits_last_only);
     if (!gf_built) { phonos_log(PHONOS_LOG_ERROR, "runtime: graph build failed"); return NULL; }
 
-    /* 2. let the scheduler place ops and allocate the compute graph */
+    /* 2. let the scheduler place ops and allocate the graph tensors.
+     *    NOTE: ggml_backend_sched_alloc_graph returns bool; the expanded,
+     *    backend-allocated graph is retrieved via ggml_backend_sched_get_compute_graph. */
     ggml_backend_sched_reset(e->sched);
-    struct ggml_cgraph* gf = ggml_backend_sched_alloc_graph(e->sched, gf_built);
-    if (!gf) { phonos_log(PHONOS_LOG_ERROR, "runtime: sched alloc failed"); return NULL; }
+    if (!ggml_backend_sched_alloc_graph(e->sched, gf_built)) {
+        phonos_log(PHONOS_LOG_ERROR, "runtime: sched alloc failed"); return NULL;
+    }
+    struct ggml_cgraph* gf = gf_built;   /* alloc_graph fills buffers in-place on this graph */
 
     /* 3. fill declared inputs — ggml_backend_tensor_set is the universal path:
      *    plain memcpy for host buffers, async H2D copy for device buffers. */

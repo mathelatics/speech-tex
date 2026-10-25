@@ -21,8 +21,8 @@
 void ph_vocab_load(struct gguf_file* g, struct ph_hparams* hp, struct ph_vocab* v) {
     memset(v, 0, sizeof(*v));
 
-    const struct gguf_array* arr = gguf_get_arr(g, "tokenizer.ggml.tokens");
-    if (!arr || arr->elem_type != GGUF_TYPE_STRING) {
+    const struct ph_gguf_array* arr = gguf_get_arr(g, "tokenizer.ggml.tokens");
+    if (!arr || arr->elem_type != PH_GGUF_TYPE_STRING) {
         phonos_log(PHONOS_LOG_ERROR, "vocab: tokenizer.ggml.tokens missing/not string array");
         return;
     }
@@ -39,8 +39,8 @@ void ph_vocab_load(struct gguf_file* g, struct ph_hparams* hp, struct ph_vocab* 
     }
 
     /* specials list (optional) */
-    const struct gguf_array* sp = gguf_get_arr(g, "tokenizer.ggml.tokens.special");
-    if (sp && sp->elem_type == GGUF_TYPE_STRING) {
+    const struct ph_gguf_array* sp = gguf_get_arr(g, "tokenizer.ggml.tokens.special");
+    if (sp && sp->elem_type == PH_GGUF_TYPE_STRING) {
         char** sl = (char**)sp->elems;
         for (uint64_t i = 0; i < sp->n; i++)
             for (int j = 0; j < v->n; j++)
