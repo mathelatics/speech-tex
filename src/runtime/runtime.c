@@ -12,6 +12,7 @@
  *   - Timing uses monotonic ms for tokens/s reporting (Phase 5 benchmarks).
  */
 #include "engine.h"
+#include "../io/phonos_hf.h"
 #include "../model/model.h"
 #include "../io/gguf_loader.h"
 #include "../core/phonos_log.h"
@@ -101,7 +102,16 @@ struct engine* engine_load(const struct engine_params* p, phonos_status* err) {
     struct engine* e = calloc(1, sizeof(*e));
     if (!e) { st = PHONOS_ERR_NOMEM; goto fail; }
 
-    e->g = gguf_file_load(p->path, p->use_mmap);
+    const char* local_path = p->path;
+    char* hf_path = NULL;
+    if (p->path && strchr(p->path, '/') && !strchr(p->path, '\\') && access(p->path, R_OK) != 0) {
+        /* not a readable local file -> try Hugging Face Hub */
+        phonos_status hst = phonos_hf_resolve(p->path, "model.q8.gguf", &hf_path);
+        if (hst != PHONOS_OK) { st = hst; goto fail; }
+        local_path = hf_path;
+    }
+    e->g = gguf_file_load(local_path, p->use_mmap);
+    free(hf_path);
     if (!e->g) { st = PHONOS_ERR_IO; goto fail; }
 
     if (ph_hparams_read(e->g, &e->hp) != 0) { st = PHONOS_ERR_FORMAT; goto fail; }
@@ -109,6 +119,9 @@ struct engine* engine_load(const struct engine_params* p, phonos_status* err) {
 
     ph_vocab_load(e->g, &e->hp, &e->vocab);
     if (e->vocab.n <= 0) { st = PHONOS_ERR_FORMAT; goto fail; }
+
+    if (e->hp.kind == PH_KIND_TTS && ph_vocoder_load(e->g, &e->hp, &e->voc) != 0) {
+        st = PHONOS_ERR_NOMEM; goto fail; }
 
     /* effective context: requested or trained, clamped to something sane */
     int want = p->n_ctx > 0 ? p->n_ctx : e->hp.n_ctx_train;

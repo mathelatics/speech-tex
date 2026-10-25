@@ -7,8 +7,19 @@
 #include <ggml-backend.h>
 #include <stdint.h>
 
-/* ---- architecture constants (fixed for phonon2; documented in PLAN) ------ */
-#define PH_ARCH_NAME      "phonon2"
+/* ---- supported GGUF architectures ----------------------------------------
+ * phonon2          : our reference speech+text multimodal arch (STT path)
+ * gradium_phonon_tts: gradium/phonon-40m-en — text-to-speech LM over discrete
+ *                     audio codes + codebook vocoder (TTS path)                */
+#define PH_ARCH_NAME        "phonon2"
+#define PH_ARCH_TTS_NAME    "gradium_phonon_tts"
+
+/* model task classification */
+enum ph_model_kind {
+    PH_KIND_UNKNOWN = 0,
+    PH_KIND_STT     = 1,   /* phonon2: audio in -> text out                  */
+    PH_KIND_TTS     = 2,   /* gradium_phonon_tts: text in -> audio out       */
+};
 #define PH_EMBD           256
 #define PH_N_HEADS        4
 #define PH_NKV            1          /* MQA: single K/V head -> tiny KV cache on mobile */
@@ -36,6 +47,7 @@ enum ph_special {
 
 /* ---- hparams ------------------------------------------------------------- */
 struct ph_hparams {
+    enum ph_model_kind kind;   /* STT / TTS dispatch at load time */
     int n_vocab;
     int n_layers;
     int n_embd;        /* == PH_EMBD validated at load */
@@ -50,7 +62,31 @@ struct ph_hparams {
     int   enc_out_dim;   /* per-frame output dim of speech encoder */
     int   enc_frames_per_chunk; /* decoder tokens consumed per 100ms window */
     uint32_t sample_rate;
+    /* TTS (gradium_phonon_tts) */
+    int   n_codebooks;       /* parallel audio code streams per frame         */
+    int   codebook_size;     /* entries per codebook                          */
+    int   frames_per_token;  /* audio frames per generated code token         */
+    int   n_text_tokens;     /* text-only part of the vocab                   */
 };
+
+/* ---- vocoder registry (TTS only): code ids -> waveform -------------------
+ * Real checkpoints may ship "vocoder.codebook[i]" tensors [frame_len, cb_size];
+ * when absent we fall back to a deterministic harmonic synthesis so the whole
+ * pipeline stays testable end-to-end without external assets. */
+struct ph_vocoder {
+    float* cb_data[16];        /* per-codebook host F32 payload (points into mem) */
+    int    cb_ne0[16];         /* entries per codebook                            */
+    int    n_codebooks;
+    int    frame_len;                  /* samples per decoded frame (overlap-add)          */
+    int    hop_len;                    /* advance per frame                                */
+    uint32_t sample_rate;
+    int    has_weights;                /* 1 if real codebooks loaded                       */
+    void*  mem;                        /* owned allocation for codebook data             */
+};
+int  ph_vocoder_load(struct gguf_file* g, const struct ph_hparams* hp, struct ph_vocoder* voc);
+void ph_vocoder_free(struct ph_vocoder* voc);
+/* decode one frame worth of code ids into out[frame_len] floats (mono). codes: [n_codebooks] */
+void ph_vocoder_decode_frame(const struct ph_vocoder* voc, const int* codes, float* out);
 
 /* ---- weight registry: named ggml tensors built from GGUF data ------------ */
 struct ph_weights {

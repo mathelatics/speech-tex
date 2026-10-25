@@ -82,6 +82,13 @@ int64_t                  gguf_get_int(const struct gguf_file* g, const char* key
 float                    gguf_get_f32(const struct gguf_file* g, const char* key, float dflt);
 const struct ph_gguf_array* gguf_get_arr(const struct gguf_file* g, const char* key);
 
+/* tensor-info lookup by name; returns index or -1 (registry order) */
+static inline int gguf_find_tensor(const struct gguf_file* g, const char* name) {
+    for (size_t i = 0; i < g->n_tensors; i++)
+        if (strcmp(g->tensors[i].name, name) == 0) return (int)i;
+    return -1;
+}
+
 /* array internals exposed to model code (tokenizer vocab etc.) */
 struct ph_gguf_array {
     enum ph_gguf_type elem_type;

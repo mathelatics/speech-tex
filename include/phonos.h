@@ -41,6 +41,7 @@ typedef enum phonos_status {
     PHONOS_ERR_INVALID_ARG = -6,
     PHONOS_ERR_UNSUPPORTED = -7,   /* op/type not available on chosen backend */
     PHONOS_ERR_CANCELLED   = -8,
+    PHONOS_NEEDS_ACCESS    = -9,   /* gated HF repo: accept license + set PHONOS_HF_TOKEN */
 } phonos_status;
 
 /* ---- logging ------------------------------------------------------------ */
@@ -121,6 +122,21 @@ PHONOS_API phonos_status phonos_transcribe(phonos_context* ctx,
                                            const char* text_prompt,   /* may be NULL */
                                            const phonos_gen_params* gp,
                                            phonos_token_cb on_token, void* user);
+
+/* ---- text-to-speech (gradium/phonon-40m-en: gradium_phonon_tts) ---------
+ * Synthesizes speech from text. Audio is delivered through the callback in
+ * chunks of up to 16-bit PCM frames; mono float32 at the model's sample rate
+ * (query it with phonos_synth_sample_rate). The callback receives one chunk
+ * per invocation; return non-zero to cancel generation early.
+ * Requires a TTS-capable model (phonos_has_synth(ctx) == 1).
+ */
+typedef int (*phonos_audio_cb)(const float* pcm, int n_frames, void* user);
+PHONOS_API int            phonos_has_synth(const phonos_context* ctx);
+PHONOS_API int            phonos_synth_sample_rate(const phonos_context* ctx);
+PHONOS_API phonos_status phonos_synth(phonos_context* ctx,
+                                      const char* text_utf8,
+                                      const phonos_gen_params* gp,
+                                      phonos_audio_cb on_audio, void* user);
 
 /* ---- perf readout (engine internals/tests/benchmarks) ------------------- */
 PHONOS_API void phonos_last_perf(const phonos_context* ctx,
