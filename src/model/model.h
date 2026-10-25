@@ -81,8 +81,9 @@ struct ph_weights {
     size_t total_bytes;
 };
 
-int  ph_weights_load(struct gguf_file* g, const struct ph_hparams* hp, struct ph_weights* w);
-void ph_weights_free(struct ph_weights* w);
+struct gguf_file; /* fwd from io/gguf_loader.h */
+
+int  ph_hparams_read(struct gguf_file* g, struct ph_hparams* hp);
 int  ph_weights_load(struct gguf_file* g, const struct ph_hparams* hp, struct ph_weights* w);
 void ph_weights_free(struct ph_weights* w);
 
@@ -102,7 +103,7 @@ struct ggml_cgraph* ph_build_graph(struct ggml_context* ctx, const struct ph_hpa
                                    int logits_last_only);
 void ph_kv_alloc(struct ph_kv_cache* kv, const struct ph_hparams* hp, int n_ctx);
 void ph_kv_free(struct ph_kv_cache* kv);
-void ph_kv_rewind(struct ph_kv_cache* kv, int new_len);
+void ph_kv_rewind(struct ph_kv_cache* kv, int new_len, int n_layers);
 
 /* ---- tokenizer (tokenizer.c) --------------------------------------------- */
 struct ph_vocab {
@@ -117,6 +118,9 @@ void ph_vocab_free(struct ph_vocab* v);
 int  ph_tokenize(const struct ph_vocab* v, const char* text, int* ids, int max_n);
 /* copy the piece for id into buf (NUL-terminated); returns buf */
 const char* ph_detokenize_piece(const struct ph_vocab* v, int id, char* buf, size_t bufsz);
+
+/* rope cos/sin tables [n_tok, hd/2] row-major; shared with runtime input fill */
+void ph_rope_tables(float* cos_t, float* sin_t, int n_tok, int hd, int pos_begin, float theta);
 
 /* ---- speech (graph_speech.c + audio front-end) --------------------------- */
 struct ggml_cgraph* ph_build_speech_graph(struct ggml_context* ctx, const struct ph_hparams* hp,

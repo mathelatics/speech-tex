@@ -38,6 +38,21 @@ struct engine_params {
     int         use_mmap;
 };
 
+/* sampler knobs shared by text generation and the (Phase 2) speech decode loop */
+struct ph_sampler_cfg {
+    int   seed;             /* <0 or temperature==0 => greedy */
+    float temperature;
+    int   top_k;            /* <=0 disables */
+    float top_p;            /* >=1 disables */
+    float repeat_penalty;   /* <=1 disables */
+};
+
+phonos_status ph_sample_next(const float* logits, int n_vocab,
+                             const struct ph_sampler_cfg* sc, uint64_t rng_state,
+                             const int* penalty_tokens, int n_penalty,
+                             int* out_id);
+uint64_t      ph_rng_advance(uint64_t state);
+
 struct gen_config {
     int   n_predict;
     int   seed;             /* <0 => greedy regardless of temperature */
