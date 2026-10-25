@@ -4,6 +4,7 @@
 #define PHONOS_GGUF_LOADER_H
 
 #include <ggml.h>
+#include <string.h>
 #include <stdint.h>
 #include <stddef.h>
 

@@ -92,10 +92,24 @@ phonos_status phonos_transcribe(phonos_context* ctx, const phonos_audio* audio,
                              text_prompt, &cfg, on_token, user);
 }
 
+int phonos_has_synth(const phonos_context* c)   { return engine_has_synth((struct engine*)c); }
+int phonos_synth_sample_rate(const phonos_context* c) { return engine_synth_sample_rate((struct engine*)c); }
+
+phonos_status phonos_synth(phonos_context* ctx, const char* text_utf8,
+                           const phonos_gen_params* gp,
+                           phonos_audio_cb on_audio, void* user) {
+    if (!ctx || !text_utf8 || !on_audio) return PHONOS_ERR_INVALID_ARG;
+    struct gen_config cfg;
+    gp_to_internal(gp, &cfg);
+    return engine_synth((struct engine*)ctx, text_utf8, &cfg, on_audio, user);
+}
+
 void phonos_last_perf(const phonos_context* ctx, double* ms_prefill,
                       double* ms_per_tok, long* n_tokens) {
     if (!ctx) {
-        if (ms_prefill) *ms_prefill = 0; if (ms_per_tok) *ms_per_tok = 0; if (n_tokens) *n_tokens = 0;
+        if (ms_prefill)  *ms_prefill = 0;
+        if (ms_per_tok)  *ms_per_tok = 0;
+        if (n_tokens)    *n_tokens = 0;
         return;
     }
     engine_last_perf((struct engine*)ctx, ms_prefill, ms_per_tok, n_tokens);

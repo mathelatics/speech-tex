@@ -93,10 +93,18 @@ phonos_status engine_transcribe(struct engine* e, const struct audio_view* av,
                                 const struct gen_config* cfg,
                                 phonos_token_cb cb, void* user);
 
+/* TTS (gradium_phonon_tts): streams PCM frames through the audio callback */
+typedef int (*phonos_audio_cb)(const float* pcm, int n_frames, void* user);
+phonos_status engine_synth(struct engine* e, const char* text_utf8,
+                           const struct gen_config* cfg,
+                           phonos_audio_cb cb, void* user);
+
 int         engine_vocab_size(struct engine* e);
 int         engine_n_layers(struct engine* e);
 int         engine_n_ctx_train(struct engine* e);
 int         engine_has_speech(struct engine* e);
+int         engine_has_synth(struct engine* e);
+int         engine_synth_sample_rate(struct engine* e);
 const char* engine_arch_name(struct engine* e);
 size_t      engine_weight_bytes(struct engine* e);
 void        engine_last_perf(struct engine* e, double* ms_prefill,

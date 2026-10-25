@@ -30,6 +30,7 @@ static void mkdir_p(const char* path) {
     mkdir(tmp, 0755);
 }
 
+static const char* hf_token(void) __attribute__((unused));
 static const char* hf_token(void) {
     static char tok[256];
     const char* t = getenv("PHONOS_HF_TOKEN");
@@ -91,7 +92,7 @@ static int curl_download(const char* url, const char* dst) {
     curl_easy_cleanup(c);
 
     int ret = 0;
-    if (rc != CURLE_OK) { PHO_LOG_ERROR("hf: %s: %s", url, err); ret = 3; }
+    if (rc != CURLE_OK) { phonos_log(PHONOS_LOG_ERROR,"hf: %s: %s", url, err); ret = 3; }
     else if (code == 401 || code == 403) ret = 1;
     else if (code == 404) ret = 2;
     else if (code >= 200 && code < 300) {
@@ -115,7 +116,7 @@ phonos_status phonos_hf_resolve(const char* spec, const char* want_file, char** 
 
     /* parse org/name[/file] */
     const char* s1 = strchr(spec, '/');
-    if (!s1) { PHO_LOG_ERROR("hf: '%s' is neither a file nor an 'org/name[/file.gguf]' repo id", spec);
+    if (!s1) { phonos_log(PHONOS_LOG_ERROR,"hf: '%s' is neither a file nor an 'org/name[/file.gguf]' repo id", spec);
                return PHONOS_ERR_INVALID_ARG; }
     const char* s2 = strchr(s1 + 1, '/');
     char org[256], name[256], file[256];
@@ -128,7 +129,7 @@ phonos_status phonos_hf_resolve(const char* spec, const char* want_file, char** 
     } else {
         snprintf(name, sizeof(name), "%s", s1 + 1);
         if (!want_file || !*want_file) {
-            PHO_LOG_ERROR("hf: repo '%s' given without a file; pass e.g. %s/model.q8.gguf", spec, spec);
+            phonos_log(PHONOS_LOG_ERROR,"hf: repo '%s' given without a file; pass e.g. %s/model.q8.gguf", spec, spec);
             return PHONOS_ERR_INVALID_ARG;
         }
         snprintf(file, sizeof(file), "%s", want_file);
@@ -150,7 +151,7 @@ phonos_status phonos_hf_resolve(const char* spec, const char* want_file, char** 
     char local[1200];
     snprintf(local, sizeof(local), "%s/%s", cache, file);
     if (stat(local, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
-        PHO_LOG_INFO("hf: using cached %s", local);
+        phonos_log(PHONOS_LOG_INFO,"hf: using cached %s", local);
         *out_path = strdup(local);
         return *out_path ? PHONOS_OK : PHONOS_ERR_NOMEM;
     }
@@ -158,21 +159,21 @@ phonos_status phonos_hf_resolve(const char* spec, const char* want_file, char** 
 #if defined(PHONOS_HAVE_CURL)
     char url[1200];
     snprintf(url, sizeof(url), "https://huggingface.co/%s/%s/resolve/%s/%s", org, name, rev, file);
-    PHO_LOG_INFO("hf: downloading %s", url);
+    phonos_log(PHONOS_LOG_INFO,"hf: downloading %s", url);
     int r = curl_download(url, local);
     if (r == 0) { *out_path = strdup(local); return *out_path ? PHONOS_OK : PHONOS_ERR_NOMEM; }
     if (r == 1) {
-        PHO_LOG_ERROR("hf: '%s/%s' is gated or requires authentication."
+        phonos_log(PHONOS_LOG_ERROR,"hf: '%s/%s' is gated or requires authentication."
                       " Accept the model license on https://huggingface.co/%s/%s then"
                       " export PHONOS_HF_TOKEN=<your token> (or `hf auth login`),"
                       " or download the GGUF manually and pass the local path.",
                       org, name, org, name);
         return PHONOS_NEEDS_ACCESS;
     }
-    if (r == 2) { PHO_LOG_ERROR("hf: file not found in repo: %s", file); return PHONOS_ERR_IO; }
+    if (r == 2) { phonos_log(PHONOS_LOG_ERROR,"hf: file not found in repo: %s", file); return PHONOS_ERR_IO; }
     return PHONOS_ERR_IO;
 #else
-    PHO_LOG_ERROR("hf: engine built without libcurl support (PHONOS_HF=OFF);"
+    phonos_log(PHONOS_LOG_ERROR,"hf: engine built without libcurl support (PHONOS_HF=OFF);"
                   " download the GGUF manually and pass its local path.");
     return PHONOS_ERR_UNSUPPORTED;
 #endif

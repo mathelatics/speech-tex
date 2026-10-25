@@ -66,7 +66,7 @@ ggml_backend_dev_t engine_pick_device(int n_gpu_layers) {
     /* prefer accelerator-type devices, keep CPU as last resort */
     for (size_t i = 0; i < n; i++) {
         ggml_backend_dev_t d = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_get_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU) continue;
+        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU) continue;
         /* sanity: device must have an active backend instance */
         ggml_backend_t b = ggml_backend_dev_init(d, NULL);
         if (!b) continue;
@@ -91,7 +91,7 @@ static void fill_backend_names(void) {
     for (size_t i = 0; i < n && g_count < MAX_BACKENDS; i++) {
         ggml_backend_dev_t d = ggml_backend_dev_get(i);
         snprintf(g_names[g_count], sizeof(g_names[0]), "%s", ggml_backend_dev_name(d));
-        g_is_cpu[g_count] = (ggml_backend_dev_get_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU);
+        g_is_cpu[g_count] = (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU);
         g_count++;
     }
 }

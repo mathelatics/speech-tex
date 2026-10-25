@@ -26,6 +26,15 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#ifdef _WIN32
+  #include <io.h>
+  #ifndef R_OK
+    #define R_OK 4
+  #endif
+  #define access _access
+#else
+  #include <unistd.h>
+#endif
 
 #define DEFAULT_CHUNK 512
 #define GRAPH_SIZE    8192
@@ -35,6 +44,7 @@ struct engine {
     struct ph_hparams   hp;
     struct ph_weights   w;
     struct ph_vocab     vocab;
+    struct ph_vocoder   voc;      /* TTS only (gradium_phonon_tts) */
 
     struct ph_kv_cache  kv;
 
@@ -84,17 +94,6 @@ static size_t estimate_step_bytes(const struct ph_hparams* hp, int chunk, int n_
 }
 
 /* ---- init/shutdown ------------------------------------------------------- */
-phonos_status engine_init(int n_threads_hint) {
-    extern phonos_status be_init(int);
-    return be_init(n_threads_hint);
-}
-void engine_shutdown(void) {
-    extern void be_shutdown(void);
-    be_shutdown();
-}
-int engine_backend_count(void)        { extern int be_backend_count(void); return be_backend_count(); }
-const char* engine_backend_name(int i){ extern const char* be_backend_name(int); return be_backend_name(i); }
-int engine_backend_is_cpu(int i)      { extern int be_backend_is_cpu(int); return be_backend_is_cpu(i); }
 
 /* ---- load ---------------------------------------------------------------- */
 struct engine* engine_load(const struct engine_params* p, phonos_status* err) {
@@ -208,6 +207,7 @@ void engine_free(struct engine* e) {
     if (e->c_build) ggml_free(e->c_build);
     if (e->be_accel) ggml_backend_free(e->be_accel);
     if (e->be_cpu) ggml_backend_free(e->be_cpu);
+    ph_vocoder_free(&e->voc);
     ph_kv_free(&e->kv);
     ph_vocab_free(&e->vocab);
     ph_weights_free(&e->w);
@@ -289,7 +289,7 @@ static const float* run_step(struct engine* e, const int* tokens, int n,
 
     /* 5. read logits: last node of the expanded graph is the lm_head mul_mat */
     struct ggml_tensor* logits = ggml_graph_node(gf, ggml_graph_n_nodes(gf)-1);
-    if (!logits || ggml_op(logits) != GGML_OP_MUL_MAT) {
+    if (!logits || logits->op != GGML_OP_MUL_MAT) {
         phonos_log(PHONOS_LOG_ERROR, "runtime: logits node missing");
         return NULL;
     }
@@ -419,12 +419,141 @@ phonos_status engine_transcribe(struct engine* e, const struct audio_view* av,
     return engine_generate(e, text_prompt, cfg, cb, user);
 }
 
+/* ---- text-to-speech (gradium_phonon_tts) ---------------------------------
+ * The LM loop is IDENTICAL to engine_generate (prefill chunks + decode steps,
+ * zero-alloc steady state). The only differences:
+ *   - sampled ids >= n_text_tokens are audio codes; we collect a window of
+ *     `n_codebooks` consecutive codes per generated token group
+ *     (frames_per_token frames share one token stream position), decode each
+ *     frame through the vocoder and stream PCM via the callback;
+ *   - eos stops synthesis.
+ * No extra allocations inside the loop: one persistent frame buffer. */
+phonos_status engine_synth(struct engine* e, const char* text_utf8,
+                           const struct gen_config* cfg,
+                           phonos_audio_cb cb, void* user) {
+    if (!e || !text_utf8 || !cb) return PHONOS_ERR_INVALID_ARG;
+    if (e->hp.kind != PH_KIND_TTS) return PHONOS_ERR_UNSUPPORTED;
+
+    const int ncb  = e->hp.n_codebooks > 0 ? e->hp.n_codebooks : 8;
+    const int fpt  = e->hp.frames_per_token > 0 ? e->hp.frames_per_token : 1;
+    const int V    = e->hp.n_vocab;
+    const int VT   = e->hp.n_text_tokens > 0 && e->hp.n_text_tokens < V
+                     ? e->hp.n_text_tokens : V;
+
+    /* per-frame code vector [ncb] + PCM frame scratch — allocated once here,
+     * reused for the whole utterance (hot loop stays alloc-free) */
+    int*   codes   = calloc((size_t)ncb, sizeof(int));
+    float* pcm_frame = malloc(sizeof(float) * (size_t)e->voc.frame_len);
+    if (!codes || !pcm_frame) { free(codes); free(pcm_frame); return PHONOS_ERR_NOMEM; }
+
+    int cap = (int)strlen(text_utf8) + 8;
+    int* ids = malloc(sizeof(int) * (size_t)cap);
+    if (!ids) { free(codes); free(pcm_frame); return PHONOS_ERR_NOMEM; }
+    int n = ph_tokenize(&e->vocab, text_utf8, ids, cap);
+    if (n < 0) { free(ids); free(codes); free(pcm_frame); return PHONOS_ERR_INVALID_ARG; }
+
+    memmove(ids+1, ids, sizeof(int)*(size_t)n);
+    ids[0] = e->vocab.bos;
+    n++;
+
+    struct ph_sampler_cfg sc = {
+        .seed = cfg->seed, .temperature = cfg->temperature,
+        .top_k = cfg->top_k, .top_p = cfg->top_p,
+        .repeat_penalty = cfg->repeat_penalty };
+    uint64_t rng = (cfg->seed >= 0) ? (uint64_t)cfg->seed : 987654321ull;
+
+    engine_reset_session(e);
+
+    double t0 = now_ms();
+    int pos = 0;
+    const float* last_logits = NULL;
+    while (pos < n) {
+        int take = n - pos; if (take > e->chunk) take = e->chunk;
+        last_logits = run_step(e, ids + pos, take, pos, 1);
+        if (!last_logits) { free(ids); free(codes); free(pcm_frame); return PHONOS_ERR_GENERIC; }
+        pos += take;
+        if (pos > e->n_ctx - 8) break;
+    }
+    e->ms_prefill = now_ms() - t0;
+    e->kv.cur_len = pos;
+
+    int next = -1;
+    {
+        int tmp_id;
+        if (ph_sample_next(last_logits, V, &sc, rng, NULL, 0, &tmp_id) != PHONOS_OK)
+            { free(ids); free(codes); free(pcm_frame); return PHONOS_ERR_NOMEM; }
+        next = tmp_id;
+    }
+
+    long budget = cfg->n_predict < 0 ? 4096 : cfg->n_predict;
+    double td0 = now_ms();
+    long generated = 0;      /* LM tokens produced          */
+    long frames_done = 0;    /* audio frames emitted so far */
+    phonos_status st = PHONOS_OK;
+
+    while (generated < budget) {
+        if (next == e->vocab.eos) break;
+
+        /* Map this LM token into codebook slots. Tokens below VT are treated
+         * as text-stream padding (skip without emitting); audio codes fill
+         * the [ncb] window round-robin across frames_per_token frames. */
+        int code = next;
+        if (code >= VT) {
+            /* one LM token contributes `fpt` identical-per-slot frames worth
+             * of codes: slot index advances by 1 each token, frame boundary
+             * every ncb tokens. */
+            int slot = (int)(generated % ncb);
+            codes[slot] = code - VT;
+
+            if (slot == ncb - 1) {                 /* frame complete -> decode */
+                for (int rep = 0; rep < fpt; rep++) {
+                    ph_vocoder_decode_frame(&e->voc, codes, pcm_frame);
+                    if (cb(pcm_frame, e->voc.frame_len, user) != 0) {
+                        st = PHONOS_ERR_CANCELLED; goto done;
+                    }
+                    frames_done++;
+                }
+            }
+        }
+
+        generated++;
+        rng = ph_rng_advance(rng);
+
+        if (e->kv.cur_len >= e->n_ctx) {
+            phonos_log(PHONOS_LOG_WARN, "synth: context full at %d tokens", e->kv.cur_len);
+            break;
+        }
+        last_logits = run_step(e, &next, 1, e->kv.cur_len, 0);
+        if (!last_logits) { st = PHONOS_ERR_GENERIC; goto done; }
+        e->kv.cur_len++;
+
+        int tmp2;
+        if (ph_sample_next(last_logits, V, &sc, rng, NULL, 0, &tmp2) != PHONOS_OK)
+            { st = PHONOS_ERR_NOMEM; goto done; }
+        next = tmp2;
+    }
+done:
+    e->ms_decode_total = now_ms() - td0;
+    e->n_generated = generated;
+    phonos_log(PHONOS_LOG_INFO, "synth: %ld tokens -> %ld frames (%.2f s audio)",
+               generated, frames_done,
+               frames_done * (double)e->voc.frame_len / (e->voc.sample_rate ? e->voc.sample_rate : 24000));
+    free(ids); free(codes); free(pcm_frame);
+    return st;
+}
+
 /* ---- introspection --------------------------------------------------------- */
 int engine_vocab_size(struct engine* e)   { return e ? e->hp.n_vocab : 0; }
 int engine_n_layers(struct engine* e)     { return e ? e->hp.n_layers : 0; }
 int engine_n_ctx_train(struct engine* e)  { return e ? e->n_ctx : 0; }
 int engine_has_speech(struct engine* e)   { return e ? e->hp.has_speech : 0; }
-const char* engine_arch_name(struct engine* e) { (void)e; return PH_ARCH_NAME; }
+int engine_has_synth(struct engine* e)    { return e && e->hp.kind == PH_KIND_TTS; }
+int engine_synth_sample_rate(struct engine* e) {
+    return (e && e->hp.kind == PH_KIND_TTS && e->voc.sample_rate) ? (int)e->voc.sample_rate : 0;
+}
+const char* engine_arch_name(struct engine* e) {
+    return (e && e->hp.kind == PH_KIND_TTS) ? PH_ARCH_TTS_NAME : PH_ARCH_NAME;
+}
 size_t engine_weight_bytes(struct engine* e){ return e ? e->w.total_bytes : 0; }
 
 void engine_last_perf(struct engine* e, double* ms_prefill, double* ms_per_tok, long* n_tokens) {

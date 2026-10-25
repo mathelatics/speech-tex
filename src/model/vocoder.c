@@ -7,7 +7,7 @@
 #include <string.h>
 #include <math.h>
 
-int ph_vocoder_load(struct gguf_file* g, const struct ph_hparams* hp, struct ph_vocoder* voc) {
+int ph_vocoder_load(const struct gguf_file* g, const struct ph_hparams* hp, struct ph_vocoder* voc) {
     memset(voc, 0, sizeof(*voc));
     int ncb = hp->n_codebooks > 0 ? hp->n_codebooks : 8;
     if (ncb > 16) ncb = 16;

@@ -7,6 +7,8 @@
 #include <ggml-backend.h>
 #include <stdint.h>
 
+struct gguf_file;   /* fwd decl (defined in ../io/gguf_loader.h) */
+
 /* ---- supported GGUF architectures ----------------------------------------
  * phonon2          : our reference speech+text multimodal arch (STT path)
  * gradium_phonon_tts: gradium/phonon-40m-en — text-to-speech LM over discrete
@@ -83,7 +85,7 @@ struct ph_vocoder {
     int    has_weights;                /* 1 if real codebooks loaded                       */
     void*  mem;                        /* owned allocation for codebook data             */
 };
-int  ph_vocoder_load(struct gguf_file* g, const struct ph_hparams* hp, struct ph_vocoder* voc);
+int  ph_vocoder_load(const struct gguf_file* g, const struct ph_hparams* hp, struct ph_vocoder* voc);
 void ph_vocoder_free(struct ph_vocoder* voc);
 /* decode one frame worth of code ids into out[frame_len] floats (mono). codes: [n_codebooks] */
 void ph_vocoder_decode_frame(const struct ph_vocoder* voc, const int* codes, float* out);
