@@ -1,13 +1,15 @@
 /* runtime.c — engine object: load, prefill/decode loop, session state.
  *
- * Performance contract (PLAN.md):
- *   - ONE ggml context holds all weights (loaded once); per-step compute uses
- *     a dedicated scratch ctx that is reset every forward pass => zero malloc
- *     in the steady-state decode loop;
- *   - KV cache buffers are allocated once at load and never reallocated;
- *   - prompt prefill runs in chunks (default 512) with logits_last_only so we
- *     pay lm_head cost once per chunk, not once per token;
- *   - timing uses monotonic ms for tokens/s reporting (Phase 5 benchmarks).
+ * Execution model (verified against vendored ggml headers):
+ *   - ONE persistent ggml_backend_sched over {accel?, cpu}; per step we
+ *     build the graph in a resettable arena ctx, sched_reset + sched_alloc_graph
+ *     + fill declared INPUT tensors (tokens / rope cos/sin / causal mask) and
+ *     sched_graph_compute. Steady-state decode => zero malloc.
+ *   - KV cache lives in ONE host buffer allocated at load (see ph_kv_alloc);
+ *     never reallocated as the sequence grows.
+ *   - Prefill runs in chunks with logits_last_only so lm_head is paid once
+ *     per chunk; decode computes full-row logits only for the final token.
+ *   - Timing uses monotonic ms for tokens/s reporting (Phase 5 benchmarks).
  */
 #include "engine.h"
 #include "../model/model.h"
@@ -15,13 +17,17 @@
 #include "../core/phonos_log.h"
 
 #include <ggml.h>
+#include <ggml-backend.h>
+#include <ggml-cpu.h>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 
 #define DEFAULT_CHUNK 512
+#define GRAPH_SIZE    8192
 
 struct engine {
     struct gguf_file*   g;
@@ -31,17 +37,22 @@ struct engine {
 
     struct ph_kv_cache  kv;
 
-    /* per-step compute arena: reset before every graph build+run */
-    struct ggml_context* c_step;
-    struct ggml_init_params step_params;
+    /* execution: persistent scheduler + reusable graph contexts */
+    ggml_backend_t             be_cpu;
+    ggml_backend_t             be_accel;      /* NULL => CPU-only            */
+    ggml_backend_sched_t       sched;
+    struct ggml_context*       c_build;       /* scratch: graph construction */
+    struct ggml_init_params    build_params;
 
-    int   n_ctx;              /* effective window (min(req, train)) */
+    int   n_ctx;              /* effective window (min(req, train))          */
     int   n_threads;
+    int   chunk;              /* prefill chunk size                           */
 
     /* reusable input staging buffers (no alloc in hot loop) */
-    int32_t* tok_buf;         /* [chunk] */
-    float*   cos_buf;         /* [chunk * HD/2] */
+    int32_t* tok_buf;         /* [chunk]                                      */
+    float*   cos_buf;         /* [chunk * HD/2]                               */
     float*   sin_buf;
+    float*   mask_buf;        /* [nkv_max * chunk]                            */
 
     /* perf counters */
     double ms_prefill;
@@ -64,7 +75,7 @@ static size_t estimate_step_bytes(const struct ph_hparams* hp, int chunk, int n_
     size_t layers  = per_tok * (size_t)chunk * (size_t)hp->n_layers;
     size_t attn    = (size_t)chunk * (size_t)n_ctx_eff * sizeof(float) * (size_t)hp->n_layers;
     size_t logits  = (size_t)hp->n_vocab * chunk * sizeof(float);
-    size_t total   = layers + attn + logits + 1u<<20;      /* +1 MiB slack */
+    size_t total   = layers + attn + logits + (1u<<20);   /* +1 MiB slack */
     if (total < (8u<<20)) total = 8u<<20;                  /* floor 8 MiB */
     return total;
 }
@@ -78,9 +89,9 @@ void engine_shutdown(void) {
     extern void be_shutdown(void);
     be_shutdown();
 }
-int engine_backend_count(void)      { extern int be_backend_count(void); return be_backend_count(); }
+int engine_backend_count(void)        { extern int be_backend_count(void); return be_backend_count(); }
 const char* engine_backend_name(int i){ extern const char* be_backend_name(int); return be_backend_name(i); }
-int engine_backend_is_cpu(int i)    { extern int be_backend_is_cpu(int); return be_backend_is_cpu(i); }
+int engine_backend_is_cpu(int i)      { extern int be_backend_is_cpu(int); return be_backend_is_cpu(i); }
 
 /* ---- load ---------------------------------------------------------------- */
 struct engine* engine_load(const struct engine_params* p, phonos_status* err) {
@@ -103,22 +114,41 @@ struct engine* engine_load(const struct engine_params* p, phonos_status* err) {
     if (e->n_ctx > e->hp.n_ctx_train) e->n_ctx = e->hp.n_ctx_train;
     if (e->n_ctx < 64) e->n_ctx = 64;
 
-    ph_kv_alloc(&e->kv, &e->hp, e->n_ctx);
-    if (!e->kv.ctx || !e->kv.k) { st = PHONOS_ERR_NOMEM; goto fail; }
+    e->chunk = (p->chunk > 0 && p->chunk <= DEFAULT_CHUNK) ? p->chunk : DEFAULT_CHUNK;
 
-    /* step arena sized from chunk=DEFAULT_CHUNK */
-    size_t bytes = estimate_step_bytes(&e->hp, DEFAULT_CHUNK, e->n_ctx);
-    e->step_params = (struct ggml_init_params){ .mem_size = bytes, .no_alloc = false };
-    e->c_step = ggml_init(e->step_params);
-    if (!e->c_step) { st = PHONOS_ERR_NOMEM; goto fail; }
+    if (ph_kv_alloc(&e->kv, &e->hp, e->n_ctx) != 0) { st = PHONOS_ERR_NOMEM; goto fail; }
 
-    e->tok_buf = malloc(sizeof(int32_t) * DEFAULT_CHUNK);
-    e->cos_buf = malloc(sizeof(float) * DEFAULT_CHUNK * (PH_EMBD/PH_N_HEADS/2));
-    e->sin_buf = malloc(sizeof(float) * DEFAULT_CHUNK * (PH_EMBD/PH_N_HEADS/2));
-    if (!e->tok_buf || !e->cos_buf || !e->sin_buf) { st = PHONOS_ERR_NOMEM; goto fail; }
+    /* ---- backends + scheduler ------------------------------------------- */
+    extern phonos_status be_init(int);
+    be_init(p->n_threads_hint);
 
-    extern int engine_n_threads_impl(void);
+    e->be_cpu = ggml_backend_cpu_init();
+    if (!e->be_cpu) { st = PHONOS_ERR_GENERIC; goto fail; }
+
+    ggml_backend_dev_t dev = engine_pick_device(p->n_gpu_layers);
+    if (dev) e->be_accel = ggml_backend_dev_init(dev, NULL);
+
+    ggml_backend_t bebs[2]; int nb = 0;
+    if (e->be_accel) bebs[nb++] = e->be_accel;
+    bebs[nb++] = e->be_cpu;
+    e->sched = ggml_backend_sched_new(bebs, NULL, nb, GRAPH_SIZE, false, true);
+    if (!e->sched) { st = PHONOS_ERR_NOMEM; goto fail; }
+
+    /* graph-construction arena (reset every forward pass) */
+    size_t bytes = estimate_step_bytes(&e->hp, e->chunk, e->n_ctx);
+    e->build_params = (struct ggml_init_params){ .mem_size = bytes, .no_alloc = false };
+    e->c_build = ggml_init(e->build_params);
+    if (!e->c_build) { st = PHONOS_ERR_NOMEM; goto fail; }
+
+    const int HD = e->hp.n_embd / e->hp.n_head;
+    e->tok_buf  = malloc(sizeof(int32_t) * (size_t)e->chunk);
+    e->cos_buf  = malloc(sizeof(float) * (size_t)e->chunk * (HD/2));
+    e->sin_buf  = malloc(sizeof(float) * (size_t)e->chunk * (HD/2));
+    e->mask_buf = malloc(sizeof(float) * (size_t)(e->n_ctx + 1) * (size_t)e->chunk);
+    if (!e->tok_buf || !e->cos_buf || !e->sin_buf || !e->mask_buf) { st = PHONOS_ERR_NOMEM; goto fail; }
+
     e->n_threads = engine_n_threads_impl();
+    be_set_cpu_threads(e->be_cpu, e->n_threads);
 
     phonos_log(PHONOS_LOG_INFO, "engine: loaded '%s' arch=%s n_ctx=%d weights=%.2f MiB",
                p->path, PH_ARCH_NAME, e->n_ctx, (double)e->w.total_bytes/1048576.0);
@@ -133,8 +163,11 @@ fail:
 
 void engine_free(struct engine* e) {
     if (!e) return;
-    free(e->tok_buf); free(e->cos_buf); free(e->sin_buf);
-    if (e->c_step) ggml_free(e->c_step);
+    free(e->tok_buf); free(e->cos_buf); free(e->sin_buf); free(e->mask_buf);
+    if (e->sched) ggml_backend_sched_free(e->sched);
+    if (e->c_build) ggml_free(e->c_build);
+    if (e->be_accel) ggml_backend_free(e->be_accel);
+    if (e->be_cpu) ggml_backend_free(e->be_cpu);
     ph_kv_free(&e->kv);
     ph_vocab_free(&e->vocab);
     ph_weights_free(&e->w);
@@ -145,53 +178,89 @@ void engine_free(struct engine* e) {
 void engine_reset_session(struct engine* e) {
     if (!e) return;
     ph_kv_rewind(&e->kv, 0, e->hp.n_layers);
+    e->kv.cur_len = 0;
 }
 
 /* ---- single forward step --------------------------------------------------
  * tokens: ids[n]; pos_begin: absolute position of first token.
- * Returns pointer into logits tensor data ([V, n] or [V, 1] when last-only),
- * or NULL on error. Caller must NOT free anything; step ctx was reset. */
+ * Returns pointer into logits data ([V, n] or [V, 1] when last-only),
+ * or NULL on error. All memory comes from the two persistent contexts. */
 static const float* run_step(struct engine* e, const int* tokens, int n,
-                             int pos_begin, int logits_last_only, int fill_rope) {
-    ggml_reset(e->c_step);
+                             int pos_begin, int logits_last_only) {
+    const int HD = e->hp.n_embd / e->hp.n_head;
 
-    struct ggml_tensor* tin = ggml_new_tensor_1d(e->c_step, GGML_I32, n);
-    memcpy(tin->data, tokens, sizeof(int32_t)*(size_t)n);
+    /* 1. build fresh graph in reset arena (zero malloc steady-state: ggml_reset
+     *    reuses the same block; no tensors are created between steps outside it) */
+    ggml_reset(e->c_build);
 
-    struct ggml_cgraph* gf = ph_build_graph(e->c_step, &e->hp, &e->w, &e->kv,
-                                            tin, n, pos_begin, logits_last_only);
-    if (!gf) { phonos_log(PHONOS_LOG_ERROR, "runtime: graph build failed"); return NULL; }
+    struct ggml_tensor* tin = ggml_new_tensor_1d(e->c_build, GGML_TYPE_I32, n);
+    ggml_set_name(tin, "input.tokens");
+    ggml_set_input(tin);
 
-    if (fill_rope) {
-        const int HD = e->hp.n_embd / e->hp.n_head;
-        ph_rope_tables(e->cos_buf, e->sin_buf, n, HD, pos_begin, e->hp.rope_theta);
-        /* find the input tensors by name? cheaper: they are the only 2-D f32
-         * inputs -> locate via graph nodes is fragile; instead re-derive: */
+    struct ggml_cgraph* gf_built = ph_build_graph(e->c_build, &e->hp, &e->w, &e->kv,
+                                                  tin, n, pos_begin, logits_last_only);
+    if (!gf_built) { phonos_log(PHONOS_LOG_ERROR, "runtime: graph build failed"); return NULL; }
+
+    /* 2. let the scheduler place ops and allocate the compute graph */
+    ggml_backend_sched_reset(e->sched);
+    struct ggml_cgraph* gf = ggml_backend_sched_alloc_graph(e->sched, gf_built);
+    if (!gf) { phonos_log(PHONOS_LOG_ERROR, "runtime: sched alloc failed"); return NULL; }
+
+    /* 3. fill declared inputs — ggml_backend_tensor_set is the universal path:
+     *    plain memcpy for host buffers, async H2D copy for device buffers. */
+    struct ggml_tensor* tok_in  = ggml_graph_get_tensor(gf, "input.tokens");
+    struct ggml_tensor* cos_in  = ggml_graph_get_tensor(gf, "rope.cos");
+    struct ggml_tensor* sin_in  = ggml_graph_get_tensor(gf, "rope.sin");
+    struct ggml_tensor* mask_in = ggml_graph_get_tensor(gf, "causal.mask");
+    if (!tok_in || !cos_in || !sin_in || !mask_in) {
+        phonos_log(PHONOS_LOG_ERROR, "runtime: input tensors missing from graph");
+        return NULL;
     }
+    #define FILL(t, src, nbytes) ggml_backend_tensor_set((t), (src), 0, (nbytes))
 
-    struct ggml_cplan plan = ggml_graph_compute_prepare(gf, 0);
-    plan.n_threads = e->n_threads;
-    enum ggml_status rc = ggml_graph_compute_with_cplan(gf, &plan);
+    FILL(tok_in, tokens, sizeof(int32_t)*(size_t)n);
+
+    ph_rope_tables(e->cos_buf, e->sin_buf, n, HD, pos_begin, e->hp.rope_theta);
+    FILL(cos_in, e->cos_buf, sizeof(float)*(size_t)n*(HD/2));
+    FILL(sin_in, e->sin_buf, sizeof(float)*(size_t)n*(HD/2));
+
+    /* causal mask [nkv, n]: additive 0 / -1e30 (keys along dim0) */
+    {
+        const int nkv = pos_begin + n;
+        for (int t = 0; t < n; t++) {
+            const int visible = pos_begin + t + 1;
+            for (int j = 0; j < nkv; j++)
+                e->mask_buf[(size_t)t*nkv + j] = (j < visible) ? 0.0f : -1e30f;
+        }
+        FILL(mask_in, e->mask_buf, sizeof(float)*(size_t)n*(size_t)nkv);
+    }
+    #undef FILL
+
+    /* 4. execute */
+    enum ggml_status rc = ggml_backend_sched_graph_compute(e->sched, gf);
     if (rc != GGML_STATUS_SUCCESS) {
-        phonos_log(PHONOS_LOG_ERROR, "runtime: ggml_graph_compute=%d", (int)rc);
+        phonos_log(PHONOS_LOG_ERROR, "runtime: sched compute=%d", (int)rc);
         return NULL;
     }
 
-    struct ggml_tensor* out = ggml_graph_get_output(gf, ggml_graph_n_nodes(gf)-1);
-    (void)out;
-    /* last expanded node is logits */
-    struct ggml_tensor* logits = gf->nodes[gf->n_nodes-1];
-    while (logits && ggml_op(logits) != GGML_OP_MUL_MAT) logits = NULL;
-    if (!logits) { phonos_log(PHONOS_LOG_ERROR, "runtime: logits node missing"); return NULL; }
-    return (const float*)logits->data;
+    /* 5. read logits: last node of the expanded graph is the lm_head mul_mat */
+    struct ggml_tensor* logits = ggml_graph_node(gf, ggml_graph_n_nodes(gf)-1);
+    if (!logits || ggml_op(logits) != GGML_OP_MUL_MAT) {
+        phonos_log(PHONOS_LOG_ERROR, "runtime: logits node missing");
+        return NULL;
+    }
+    if (ggml_backend_buffer_is_host(logits->buffer)) {
+        return (const float*)logits->data;   /* CPU path: zero copy */
+    }
+    {
+        /* device logits -> copy out once per step (Phase 4 will keep sampling on-device) */
+        static float* tmp = NULL; static size_t tmp_sz = 0;
+        size_t need = ggml_nbytes(logits);
+        if (need > tmp_sz) { free(tmp); tmp = malloc(need); tmp_sz = need; }
+        ggml_backend_tensor_get(logits, tmp, 0, need);
+        return tmp;
+    }
 }
-
-/* NOTE on rope inputs: ph_build_graph marks cos_t/sin_t as ggml_set_input but
- * fills them itself in older revision; to keep the runtime simple and robust
- * we rebuild tables inside the graph builder path via set_input tensors.
- * See fix below: we actually let graph builder own table memory and runtime
- * only passes pos_begin (already implemented). The fill_rope branch above is
- * therefore unused; kept for future external-rope optimization. */
 
 /* ---- generation loop ------------------------------------------------------ */
 phonos_status engine_generate(struct engine* e, const char* prompt_utf8,
@@ -199,9 +268,10 @@ phonos_status engine_generate(struct engine* e, const char* prompt_utf8,
                               phonos_token_cb cb, void* user) {
     if (!e || !prompt_utf8 || !cb) return PHONOS_ERR_INVALID_ARG;
 
-    int max_ids = DEFAULT_CHUNK;
-    int* ids = malloc(sizeof(int)*(size_t)(strlen(prompt_utf8)+8));
-    int n = ph_tokenize(&e->vocab, prompt_utf8, ids, max_ids);
+    int cap = (int)strlen(prompt_utf8) + 8;
+    int* ids = malloc(sizeof(int)*(size_t)cap);
+    if (!ids) return PHONOS_ERR_NOMEM;
+    int n = ph_tokenize(&e->vocab, prompt_utf8, ids, cap);
     if (n < 0) { free(ids); return PHONOS_ERR_INVALID_ARG; }
 
     /* insert BOS at front (shift) */
@@ -222,8 +292,8 @@ phonos_status engine_generate(struct engine* e, const char* prompt_utf8,
     int pos = 0;
     const float* last_logits = NULL;
     while (pos < n) {
-        int take = n - pos; if (take > DEFAULT_CHUNK) take = DEFAULT_CHUNK;
-        last_logits = run_step(e, ids + pos, take, pos, /*last_only*/1, 0);
+        int take = n - pos; if (take > e->chunk) take = e->chunk;
+        last_logits = run_step(e, ids + pos, take, pos, /*last_only*/1);
         if (!last_logits) { free(ids); return PHONOS_ERR_GENERIC; }
         pos += take;
         if (pos > e->n_ctx - 8) break;   /* window full: drop rest of prompt */
@@ -231,16 +301,16 @@ phonos_status engine_generate(struct engine* e, const char* prompt_utf8,
     e->ms_prefill = now_ms() - t0;
     e->kv.cur_len = pos;                 /* graph wrote KV up to pos */
 
-    /* ---- autoregressive decode ---- */
+    /* ---- first sample ---- */
     int next = -1;
     {
-        int tmp;
-        if (ph_sample_next((float*)last_logits, e->hp.n_vocab, &sc, rng, NULL, 0, &tmp) != PHONOS_OK)
+        int tmp_id;
+        if (ph_sample_next(last_logits, e->hp.n_vocab, &sc, rng, NULL, 0, &tmp_id) != PHONOS_OK)
             { free(ids); return PHONOS_ERR_NOMEM; }
-        next = tmp;
+        next = tmp_id;
     }
 
-    /* penalty history: reuse ids buffer tail region? simpler: small fixed ring */
+    /* penalty history: fixed ring (no alloc in loop) */
     int hist[512]; int nhist = 0;
     #define PUSH_HIST(t) do { if (nhist < 512) hist[nhist++] = (t); } while (0)
     for (int i = 0; i < pos && i < 512; i++) PUSH_HIST(ids[i]);
@@ -253,6 +323,7 @@ phonos_status engine_generate(struct engine* e, const char* prompt_utf8,
             if (strcmp(e->vocab.text[t], cfg->stop_word) == 0) { stop_id = t; break; }
     }
 
+    /* ---- autoregressive decode ---- */
     double td0 = now_ms();
     long generated = 0;
     while (generated < budget) {
@@ -270,12 +341,12 @@ phonos_status engine_generate(struct engine* e, const char* prompt_utf8,
             break;
         }
 
-        last_logits = run_step(e, &next, 1, e->kv.cur_len, 0, 0);
+        last_logits = run_step(e, &next, 1, e->kv.cur_len, 0);
         if (!last_logits) { free(ids); return PHONOS_ERR_GENERIC; }
         e->kv.cur_len++;
 
         int tmp2;
-        if (ph_sample_next((float*)last_logits, e->hp.n_vocab, &sc, rng,
+        if (ph_sample_next(last_logits, e->hp.n_vocab, &sc, rng,
                            hist, nhist, &tmp2) != PHONOS_OK) { free(ids); return PHONOS_ERR_NOMEM; }
         next = tmp2;
         rng = ph_rng_advance(rng);
@@ -284,7 +355,6 @@ phonos_status engine_generate(struct engine* e, const char* prompt_utf8,
     e->n_generated = generated;
 
     free(ids);
-    (void)max_ids;
     return PHONOS_OK;
 }
 

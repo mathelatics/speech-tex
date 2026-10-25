@@ -2,8 +2,9 @@
  *
  * Layout conventions (ggml column-major ne[] order):
  *   weights : w_proj [out, in]  -> ggml_mul_mat(w, x) with x [in, n_tokens]
- *   cache   : K/V per layer     [HD, n_ctx]           (MQA: one KV head)
- *   scores  : kept as [nkv, n_tokens] so softmax normalizes over dim0 = keys
+ *   cache   : K/V per layer     [n_ctx, HD]           (MQA: one KV head;
+ *             dim0 = keys so softmax normalizes over dim0)
+ *   scores  : [n_ctx, n_tokens] (keys along dim0)
  *
  * Performance rules baked in:
  *   - step context is arena-reset by runtime.c each call; no malloc here;
@@ -18,6 +19,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define GRAPH_SIZE_BUILD 8192
 
 static struct ggml_tensor* norm_affine(struct ggml_context* c, struct ggml_tensor* x,
                                        struct ggml_tensor* w, struct ggml_tensor* b, float eps) {
@@ -60,13 +63,13 @@ struct ggml_cgraph* ph_build_graph(struct ggml_context* ctx, const struct ph_hpa
     const int E   = hp->n_embd;
     const int NH  = hp->n_head;
     const int HD  = E / NH;
+    const int NC  = kv->n_ctx;
     const int nkv_max = pos_begin + n_tokens;   /* keys visible to this step */
 
-    struct ggml_cgraph* gf = ggml_new_graph_custom(ctx, 8192, false);
+    struct ggml_cgraph* gf = ggml_new_graph_custom(ctx, GRAPH_SIZE_BUILD, false);
 
     /* rope tables + causal mask are INPUT tensors: the builder only declares
-     * shapes; runtime.c fills them after sched alloc (views into persistent
-     * engine buffers -> zero copies, zero allocs in the steady-state loop). */
+     * shapes; runtime.c fills them after sched alloc. */
     struct ggml_tensor* cos_t = ggml_new_tensor_2d(ctx, GGML_F32, HD/2, n_tokens);
     struct ggml_tensor* sin_t = ggml_new_tensor_2d(ctx, GGML_F32, HD/2, n_tokens);
     ggml_set_name(cos_t, "rope.cos");  ggml_set_input(cos_t);
@@ -85,32 +88,34 @@ struct ggml_cgraph* ph_build_graph(struct ggml_context* ctx, const struct ph_hpa
         struct ggml_tensor* k = ggml_mul_mat(ctx, w->wk[L], h);          /* [HD, n] */
         struct ggml_tensor* v = ggml_mul_mat(ctx, w->wv[L], h);          /* [HD, n] */
 
-        struct ggml_tensor* k_rope = rope_apply(ctx, k, cos_t, sin_t);
+        struct ggml_tensor* k_rope = rope_apply(ctx, k, cos_t, sin_t);   /* [HD, n] */
 
-        /* append K,V into cache at [pos_begin .. ) */
-        struct ggml_tensor* kcache = kv->k[L];                            /* [HD, NC] */
+        /* append K,V into cache at [pos_begin .. ) — cache layout [NC, HD]:
+         * slice = rows pos_begin.., all cols -> view_2d(ne0=n, ne1=HD) */
+        struct ggml_tensor* kcache = kv->k[L];                            /* [NC, HD] */
         struct ggml_tensor* vcache = kv->v[L];
-        struct ggml_tensor* kslice = ggml_view_2d(ctx, kcache, HD, n_tokens, kcache->nb[1],
-                                                  (size_t)pos_begin * kcache->nb[1]);
-        struct ggml_tensor* vslice = ggml_view_2d(ctx, vcache, HD, n_tokens, vcache->nb[1],
-                                                  (size_t)pos_begin * vcache->nb[1]);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, k_rope, kslice));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, v,     vslice));
+        struct ggml_tensor* kslice = ggml_view_2d(ctx, kcache, n_tokens, HD, kcache->nb[1],
+                                                  (size_t)pos_begin * kcache->nb[0]);
+        struct ggml_tensor* vslice = ggml_view_2d(ctx, vcache, n_tokens, HD, vcache->nb[1],
+                                                  (size_t)pos_begin * vcache->nb[0]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_transpose(ctx, k_rope), kslice));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_transpose(ctx, v),       vslice));
 
-        /* attention per query head (MQA: all heads read same K/V window) */
+        /* attention per query head (MQA: all heads read same K/V window).
+         * kc/vc views: [nkv, HD] starting at col 0 of the cache rows. */
         struct ggml_tensor* attn_outs[8];
         for (int hh = 0; hh < NH && hh < 8; hh++) {
             struct ggml_tensor* qh  = ggml_view_2d(ctx, q, HD, n_tokens, q->nb[1],
                                                    (size_t)(hh*HD)*ggml_element_size(q));
-            struct ggml_tensor* qhr = rope_apply(ctx, qh, cos_t, sin_t);
-            struct ggml_tensor* kc  = ggml_view_2d(ctx, kcache, HD, nkv_max, kcache->nb[1], 0);
-            struct ggml_tensor* vc  = ggml_view_2d(ctx, vcache, HD, nkv_max, vcache->nb[1], 0);
+            struct ggml_tensor* qhr = rope_apply(ctx, qh, cos_t, sin_t);  /* [HD, n] */
+            struct ggml_tensor* kc  = ggml_view_2d(ctx, kcache, nkv_max, HD, kcache->nb[1], 0); /* [nkv, HD] */
+            struct ggml_tensor* vc  = ggml_view_2d(ctx, vcache, nkv_max, HD, vcache->nb[1], 0);
 
             struct ggml_tensor* s = ggml_mul_mat(ctx, kc, qhr);           /* [nkv, n] */
             s = ggml_scale(ctx, s, 1.0f/sqrtf((float)HD));
             s = ggml_add(ctx, s, mask);
             struct ggml_tensor* p = ggml_soft_max_ext(ctx, s, NULL, 1.0f, 0.0f); /* over dim0 = keys ✓ */
-            attn_outs[hh] = ggml_mul_mat(ctx, vc, ggml_transpose(ctx, p)); /* [HD, n] */
+            attn_outs[hh] = ggml_mul_mat(ctx, ggml_permute(ctx, vc, 1, 0, 2, 3), p); /* [HD, n] */
         }
 
         /* merge heads into contiguous [E, n] scratch via copies (correct strides) */
@@ -144,33 +149,56 @@ struct ggml_cgraph* ph_build_graph(struct ggml_context* ctx, const struct ph_hpa
     return gf;
 }
 
-/* ---- KV cache ------------------------------------------------------------ */
-void ph_kv_alloc(struct ph_kv_cache* kv, const struct ph_hparams* hp, int n_ctx) {
+/* ---- KV cache ------------------------------------------------------------
+ * ONE persistent host buffer holds every K/V tensor payload; tensor structs
+ * live in a no_alloc ctx. Cache tensors are [n_ctx, HD] (dim0 = keys) so the
+ * attention softmax normalizes over dim0 directly — no transposes at read time.
+ * Allocated once at load, never reallocated as the sequence grows. */
+int ph_kv_alloc(struct ph_kv_cache* kv, const struct ph_hparams* hp, int n_ctx) {
     memset(kv, 0, sizeof(*kv));
     const int HD = hp->n_embd / hp->n_head;
-    const size_t per = (size_t)n_ctx * HD * sizeof(float) + 128;
-    struct ggml_init_params p = { .mem_size = per*2*(size_t)hp->n_layers + 4096, .no_alloc = false };
+    const size_t per   = (size_t)n_ctx * HD * sizeof(float);
+    const size_t total = per * 2 * (size_t)hp->n_layers;
+
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!cpu_dev) { phonos_log(PHONOS_LOG_ERROR, "kv: no CPU device registered"); return -1; }
+    kv->buf = ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(cpu_dev), total);
+    if (!kv->buf) { phonos_log(PHONOS_LOG_ERROR, "kv: buffer alloc (%zu B) failed", total); return -1; }
+
+    char* base = (char*)ggml_backend_buffer_get_base(kv->buf);
+    ggml_backend_buffer_clear(kv->buf, 0, total);      /* zero-fill once */
+
+    struct ggml_init_params p = { .mem_size = (size_t)hp->n_layers*96 + 4096, .no_alloc = true };
     kv->ctx = ggml_init(p);
-    if (!kv->ctx) { phonos_log(PHONOS_LOG_ERROR, "kv: ggml_init failed"); return; }
+    if (!kv->ctx) { phonos_log(PHONOS_LOG_ERROR, "kv: ggml_init failed"); goto bad; }
     kv->k = calloc(hp->n_layers, sizeof(struct ggml_tensor*));
     kv->v = calloc(hp->n_layers, sizeof(struct ggml_tensor*));
+    if (!kv->k || !kv->v) goto bad;
+
     for (int L = 0; L < hp->n_layers; L++) {
-        int64_t ne[2] = {HD, n_ctx};
-        kv->k[L] = ggml_new_tensor(kv->ctx, GGML_F32, 2, ne);
-        kv->v[L] = ggml_new_tensor(kv->ctx, GGML_F32, 2, ne);
         char nm[32];
-        snprintf(nm,sizeof nm,"kvcache.k%d",L); ggml_set_name(kv->k[L],nm);
-        snprintf(nm,sizeof nm,"kvcache.v%d",L); ggml_set_name(kv->v[L],nm);
-        memset(kv->k[L]->data, 0, (size_t)n_ctx*HD*sizeof(float));
-        memset(kv->v[L]->data, 0, (size_t)n_ctx*HD*sizeof(float));
+        snprintf(nm, sizeof nm, "kvcache.k%d", L);
+        kv->k[L] = ggml_new_tensor_2d(kv->ctx, GGML_F32, n_ctx, HD);     /* [NC, HD] */
+        ggml_set_name(kv->k[L], nm);
+        if (ggml_backend_tensor_alloc(kv->buf, kv->k[L], base + (size_t)(2*L)*per) != GGML_STATUS_SUCCESS) goto bad;
+
+        snprintf(nm, sizeof nm, "kvcache.v%d", L);
+        kv->v[L] = ggml_new_tensor_2d(kv->ctx, GGML_F32, n_ctx, HD);
+        ggml_set_name(kv->v[L], nm);
+        if (ggml_backend_tensor_alloc(kv->buf, kv->v[L], base + (size_t)(2*L+1)*per) != GGML_STATUS_SUCCESS) goto bad;
     }
     kv->n_ctx = n_ctx;
     kv->cur_len = 0;
+    return 0;
+bad:
+    ph_kv_free(kv);
+    return -1;
 }
 
 void ph_kv_free(struct ph_kv_cache* kv) {
     if (!kv) return;
     if (kv->ctx) ggml_free(kv->ctx);
+    if (kv->buf) ggml_backend_buffer_free(kv->buf);
     free(kv->k); free(kv->v);
     memset(kv, 0, sizeof(*kv));
 }
@@ -178,12 +206,13 @@ void ph_kv_free(struct ph_kv_cache* kv) {
 void ph_kv_rewind(struct ph_kv_cache* kv, int new_len, int n_layers) {
     if (new_len < 0) new_len = 0;
     if (new_len >= kv->cur_len) { if (new_len > kv->cur_len) kv->cur_len = new_len; return; }
-    const int HD = (int)kv->k[0]->ne[0];
+    const int HD = (int)kv->k[0]->ne[1];
+    const size_t row = kv->k[0]->nb[1];                 /* bytes per key row */
     for (int L = 0; L < n_layers; L++) {
-        memset((char*)kv->k[L]->data + (size_t)new_len*HD*sizeof(float), 0,
-               (size_t)(kv->cur_len-new_len)*HD*sizeof(float));
-        memset((char*)kv->v[L]->data + (size_t)new_len*HD*sizeof(float), 0,
-               (size_t)(kv->cur_len-new_len)*HD*sizeof(float));
+        memset((char*)kv->k[L]->data + (size_t)new_len*row, 0,
+               (size_t)(kv->cur_len-new_len)*row);
+        memset((char*)kv->v[L]->data + (size_t)new_len*row, 0,
+               (size_t)(kv->cur_len-new_len)*row);
     }
     kv->cur_len = new_len;
 }

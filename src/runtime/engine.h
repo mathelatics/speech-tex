@@ -33,6 +33,7 @@ ggml_backend_dev_t engine_pick_device(int n_gpu_layers);
 /* backend_dispatch.c helpers used by runtime.c (device layer only) */
 int  be_n_gpu_layers(void);
 void be_set_cpu_threads(ggml_backend_t cpu_be, int n_threads);
+int  engine_n_threads_impl(void);   /* resolved thread count after init */
 
 /* ---- loaded model / session --------------------------------------------- */
 struct engine_params {
@@ -40,6 +41,8 @@ struct engine_params {
     int         n_gpu_layers;
     int         n_ctx;        /* 0 => from metadata */
     int         use_mmap;
+    int         chunk;        /* prefill chunk tokens; 0 => default 512 */
+    int         n_threads_hint; /* 0 => auto */
 };
 
 /* sampler knobs shared by text generation and the (Phase 2) speech decode loop */

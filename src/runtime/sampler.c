@@ -25,18 +25,29 @@ static int cmp_desc(const void* a, const void* b) {
     return 0;
 }
 
-phonos_status ph_sample_next(const float* logits, int n_vocab,
+phonos_status ph_sample_next(const float* logits_in, int n_vocab,
                              const struct ph_sampler_cfg* sc, uint64_t rng_state,
                              const int* penalty_tokens, int n_penalty,
                              int* out_id) {
-    /* ---- repeat penalty (in-place on a private copy would be cleaner; we
-     * mutate the provided row then restore it — cheap, avoids extra buffer) */
+    /* never mutate engine-owned logits: work on a thread-local scratch copy */
+    static _Thread_local float* s_log = NULL;
+    static _Thread_local int    s_lcap = 0;
+    if (s_lcap < n_vocab) {
+        free(s_log);
+        s_log = malloc((size_t)n_vocab * sizeof(float));
+        if (!s_log) return PHONOS_ERR_NOMEM;
+        s_lcap = n_vocab;
+    }
+    const float* logits = s_log;
+    memcpy(s_log, logits_in, (size_t)n_vocab * sizeof(float));
+
+    /* ---- repeat penalty ---- */
     if (sc->repeat_penalty > 1.0f && penalty_tokens && n_penalty > 0) {
         for (int i = 0; i < n_penalty; i++) {
             int t = penalty_tokens[i];
             if (t < 0 || t >= n_vocab) continue;
-            float v = logits[t];
-            logits[t] = v > 0.0f ? v / sc->repeat_penalty : v * sc->repeat_penalty;
+            float v = ((float*)logits)[t];
+            ((float*)logits)[t] = v > 0.0f ? v / sc->repeat_penalty : v * sc->repeat_penalty;
         }
     }
 

@@ -30,6 +30,8 @@ phonos_context* phonos_model_load(const phonos_model_params* mp, phonos_status* 
     ep.n_gpu_layers = mp->n_gpu_layers;
     ep.n_ctx        = mp->n_ctx;
     ep.use_mmap     = mp->use_mmap;
+    ep.chunk        = mp->n_ctx_chunk;
+    ep.n_threads_hint = mp->n_threads;
 
     struct engine* e = engine_load(&ep, out_err);
     if (!e) return NULL;
@@ -69,6 +71,7 @@ phonos_status phonos_generate(phonos_context* ctx, const char* prompt_utf8,
     if (!ctx || !prompt_utf8 || !on_token) return PHONOS_ERR_INVALID_ARG;
     struct gen_config cfg;
     gp_to_internal(gp, &cfg);
+    /* public API contract: the engine prepends BOS itself (runtime.c) */
     return engine_generate((struct engine*)ctx, prompt_utf8, &cfg, on_token, user);
 }
 

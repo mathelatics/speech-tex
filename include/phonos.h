@@ -88,6 +88,7 @@ typedef struct phonos_model_params {
     int         n_gpu_layers;  /* 0 => pure CPU; >0 => offload if backend present */
     int         n_ctx;         /* prompt/context window; 0 => from metadata */
     int         use_mmap;      /* mmap weights when available               */
+    int         n_threads;     /* 0 => auto (honors phonos_init hint)       */
 } phonos_model_params;
 
 PHONOS_API phonos_context* phonos_model_load(const phonos_model_params* mp, phonos_status* out_err);

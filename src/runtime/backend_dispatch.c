@@ -107,3 +107,13 @@ int engine_backend_is_cpu(int i) {
     if (i < 0 || i >= g_count) return 0;
     return g_is_cpu[i];
 }
+
+/* ---- resolved thread count (used by runtime.c at load) ------------------- */
+int engine_n_threads_impl(void) { return engine_n_threads(); }
+
+/* ---- backend registry helpers called from runtime.c ---------------------- */
+phonos_status be_init(int n_threads_hint) { return engine_init(n_threads_hint); }
+void          be_shutdown(void)           { engine_shutdown(); }
+int           be_backend_count(void)      { return engine_backend_count(); }
+const char*   be_backend_name(int i)      { return engine_backend_name(i); }
+int           be_backend_is_cpu(int i)    { return engine_backend_is_cpu(i); }

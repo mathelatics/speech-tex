@@ -24,6 +24,7 @@ static struct ggml_tensor* dup_tensor(struct ggml_context* ctx,
                                       const struct gguf_file* g, int idx,
                                       struct ph_weights* w) {
     const struct gguf_tensor_info* ti = &g->tensors[idx];
+    char* base = (char*)ggml_backend_buffer_get_base(w->buf);
     int64_t ne[4] = {1,1,1,1};
     for (uint32_t d = 0; d < ti->n_dims && d < 4; d++) ne[d] = (int64_t)ti->ne[d];
     struct ggml_tensor* t = ggml_new_tensor(ctx, ti->type, (int)ti->n_dims, ne);
@@ -41,7 +42,7 @@ static struct ggml_tensor* dup_tensor(struct ggml_context* ctx,
         phonos_log(PHONOS_LOG_ERROR, "weights: tensor_alloc failed for '%s'", ti->name);
         return NULL;
     }
-    ggml_backend_buffer_write(w->buf, g->weights_base + ti->offset, off, ti->size);
+    memcpy(base + off, g->weights_base + ti->offset, ti->size);
     w->buf_cursor = off + ti->size;
     return t;
 }
@@ -79,6 +80,7 @@ int ph_weights_load(struct gguf_file* g, const struct ph_hparams* hp, struct ph_
         phonos_log(PHONOS_LOG_ERROR, "weights: buffer alloc (%zu B) failed", buf_size);
         return -1;
     }
+    w->base = (char*)ggml_backend_buffer_get_base(w->buf);   /* host-visible base */
     w->buf_cursor = 0;
 
     /* tensor structs only — data pointers assigned per tensor below */
