@@ -18,26 +18,50 @@ static int tidx(const struct gguf_file* g, const char* name) {
     return -1;
 }
 
-/* create tensor of same type/shape as GGUF entry idx and copy payload in */
+/* create tensor of same type/shape as GGUF entry idx; payload written into the
+ * contiguous weight buffer (native types preserved, zero dequant on load) */
 static struct ggml_tensor* dup_tensor(struct ggml_context* ctx,
-                                      const struct gguf_file* g, int idx) {
+                                      const struct gguf_file* g, int idx,
+                                      struct ph_weights* w) {
     const struct gguf_tensor_info* ti = &g->tensors[idx];
     int64_t ne[4] = {1,1,1,1};
     for (uint32_t d = 0; d < ti->n_dims && d < 4; d++) ne[d] = (int64_t)ti->ne[d];
     struct ggml_tensor* t = ggml_new_tensor(ctx, ti->type, (int)ti->n_dims, ne);
     if (!t) return NULL;
     ggml_set_name(t, ti->name);
-    memcpy(t->data, g->weights_base + ti->offset, ti->size);
+
+    /* 64B-align each tensor within the arena (quant blocks like F32 rows want it) */
+    size_t off = (w->buf_cursor + 63) & ~(size_t)63;
+    if (off + ti->size > ggml_backend_buffer_get_size(w->buf)) {
+        phonos_log(PHONOS_LOG_ERROR, "weights: arena overflow at '%s'", ti->name);
+        return NULL;
+    }
+    if (ggml_backend_tensor_alloc(w->buf, t, (char*)ggml_backend_buffer_get_base(w->buf) + off)
+        != GGML_STATUS_SUCCESS) {
+        phonos_log(PHONOS_LOG_ERROR, "weights: tensor_alloc failed for '%s'", ti->name);
+        return NULL;
+    }
+    ggml_backend_buffer_write(w->buf, g->weights_base + ti->offset, off, ti->size);
+    w->buf_cursor = off + ti->size;
     return t;
 }
 
 #define LOAD(dst_field, NAME) do { \
     int _i = tidx(g, (NAME)); \
     if (_i < 0) { phonos_log(PHONOS_LOG_ERROR, "weights: missing tensor '%s'", (NAME)); return -1; } \
-    dst_field = dup_tensor(w->ctx_data, g, _i); \
+    dst_field = dup_tensor(w->ctx_data, g, _i, w); \
     if (!(dst_field)) return -1; \
 } while (0)
 
+/* Weight storage strategy (PLAN.md §quantization-first):
+ *   - ONE contiguous host buffer (ggml_backend_cpu_buffer) holds every tensor
+ *     payload exactly as it appears in the GGUF file (native quant types stay
+ *     native — zero dequant on load).
+ *   - Tensor structs live in a no_alloc ggml_context; their ->data points into
+ *     the buffer. On CPU this is zero-copy; Phase-4 GPU offload will instead
+ *     allocate a device buffer and async-copy each tensor once at load time.
+ * This gives us: deterministic RSS, one free() at teardown, and a single place
+ * to swap host<->device placement without touching any model code.          */
 int ph_weights_load(struct gguf_file* g, const struct ph_hparams* hp, struct ph_weights* w) {
     memset(w, 0, sizeof(*w));
 
@@ -45,9 +69,21 @@ int ph_weights_load(struct gguf_file* g, const struct ph_hparams* hp, struct ph_
     for (size_t i = 0; i < g->n_tensors; i++) total += g->tensors[i].size;
     w->total_bytes = total;
 
-    /* per-tensor overhead: ggml_object header + tensor struct alignment (~96B safe) */
+    /* contiguous host buffer; tensor payloads are written into it below */
+    const size_t align = 64;
+    const size_t buf_size = (total + align - 1) & ~(align - 1);
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!cpu_dev) { phonos_log(PHONOS_LOG_ERROR, "weights: no CPU device registered"); return -1; }
+    w->buf = ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(cpu_dev), buf_size);
+    if (!w->buf) {
+        phonos_log(PHONOS_LOG_ERROR, "weights: buffer alloc (%zu B) failed", buf_size);
+        return -1;
+    }
+    w->buf_cursor = 0;
+
+    /* tensor structs only — data pointers assigned per tensor below */
     const size_t overhead = g->n_tensors * 96 + 4096;
-    struct ggml_init_params p = { .mem_size = total + overhead, .no_alloc = false };
+    struct ggml_init_params p = { .mem_size = overhead, .no_alloc = true };
     w->ctx_data = ggml_init(p);
     if (!w->ctx_data) {
         phonos_log(PHONOS_LOG_ERROR, "weights: ggml_init(%zu B) failed", p.mem_size);
@@ -101,6 +137,7 @@ int ph_weights_load(struct gguf_file* g, const struct ph_hparams* hp, struct ph_
 void ph_weights_free(struct ph_weights* w) {
     if (!w) return;
     if (w->ctx_data) ggml_free(w->ctx_data);
+    if (w->buf) ggml_backend_buffer_free(w->buf);
     free(w->attn_norm_w); free(w->attn_norm_b);
     free(w->wq); free(w->wk); free(w->wv); free(w->wo);
     free(w->ffn_norm_w); free(w->ffn_norm_b);

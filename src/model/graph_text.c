@@ -62,25 +62,21 @@ struct ggml_cgraph* ph_build_graph(struct ggml_context* ctx, const struct ph_hpa
     const int HD  = E / NH;
     const int nkv_max = pos_begin + n_tokens;   /* keys visible to this step */
 
-    struct ggml_cgraph* gf = ggml_new_graph_custom(ctx, 4096, false);
+    struct ggml_cgraph* gf = ggml_new_graph_custom(ctx, 8192, false);
 
-    /* rope tables are tables are filled here per build (cheap: HD/2*n trig calls, no malloc) */
+    /* rope tables + causal mask are INPUT tensors: the builder only declares
+     * shapes; runtime.c fills them after sched alloc (views into persistent
+     * engine buffers -> zero copies, zero allocs in the steady-state loop). */
     struct ggml_tensor* cos_t = ggml_new_tensor_2d(ctx, GGML_F32, HD/2, n_tokens);
     struct ggml_tensor* sin_t = ggml_new_tensor_2d(ctx, GGML_F32, HD/2, n_tokens);
-    ggml_set_name(cos_t, "rope.cos");
-    ggml_set_name(sin_t, "rope.sin");
-    ph_rope_tables((float*)cos_t->data, (float*)sin_t->data, n_tokens, HD, pos_begin, hp->rope_theta);
+    ggml_set_name(cos_t, "rope.cos");  ggml_set_input(cos_t);
+    ggml_set_name(sin_t, "rope.sin");  ggml_set_input(sin_t);
 
     struct ggml_tensor* x = ggml_get_rows(ctx, w->tok_emb, tokens_in);   /* [E, n] */
 
     /* causal mask [nkv, n]: additive 0 / -1e30 (keys along dim0 to match scores layout) */
     struct ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_F32, nkv_max, n_tokens);
-    {
-        float* md = (float*)mask->data;
-        for (int j = 0; j < nkv_max; j++)
-            for (int i = 0; i < n_tokens; i++)
-                md[j*n_tokens + i] = (j <= pos_begin + i) ? 0.0f : -1e30f;
-    }
+    ggml_set_name(mask, "causal.mask"); ggml_set_input(mask);
 
     for (int L = 0; L < hp->n_layers; L++) {
         struct ggml_tensor* h = norm_affine(ctx, x, w->attn_norm_w[L], w->attn_norm_b[L], hp->eps_norm);

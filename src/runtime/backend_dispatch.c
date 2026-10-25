@@ -21,6 +21,19 @@ static void fill_backend_names(void);
 
 int engine_n_threads(void) { return g_n_threads > 0 ? g_n_threads : 1; }
 
+/* how many layers to hand to the accelerator (0 => pure CPU path) */
+static int g_n_gpu_layers = 0;
+int be_n_gpu_layers(void) { return g_n_gpu_layers; }
+
+/* per-graph CPU thread override (ggml-cpu.h), applied before sched compute */
+void be_set_cpu_threads(ggml_backend_t cpu_be, int n_threads) {
+#ifdef GGML_USE_CPU
+    if (cpu_be) ggml_backend_cpu_set_n_threads(cpu_be, n_threads);
+#else
+    (void)cpu_be; (void)n_threads;
+#endif
+}
+
 phonos_status engine_init(int n_threads_hint) {
     if (g_initialized) return PHONOS_OK;
 

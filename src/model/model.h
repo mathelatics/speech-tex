@@ -4,6 +4,7 @@
 #define PHONOS_MODEL_H
 
 #include <ggml.h>
+#include <ggml-backend.h>
 #include <stdint.h>
 
 /* ---- architecture constants (fixed for phonon2; documented in PLAN) ------ */
@@ -53,7 +54,9 @@ struct ph_hparams {
 
 /* ---- weight registry: named ggml tensors built from GGUF data ------------ */
 struct ph_weights {
-    struct ggml_context* ctx_data;   /* owns weight tensors (mmap or malloc'd bufs) */
+    struct ggml_context* ctx_data;   /* owns tensor structs (no_alloc arena)  */
+    ggml_backend_buffer_t buf;       /* persistent host/device weight buffer  */
+    size_t               buf_cursor; /* bump allocator into buf               */
 
     struct ggml_tensor* tok_emb;     /* [n_embd, n_vocab]  */
     struct ggml_tensor* out_norm_w;  /* [n_embd]           */

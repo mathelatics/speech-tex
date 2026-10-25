@@ -30,6 +30,10 @@ int           engine_n_threads(void);
 /* returns accelerator device or NULL (=CPU). Implemented in backend_dispatch.c */
 ggml_backend_dev_t engine_pick_device(int n_gpu_layers);
 
+/* backend_dispatch.c helpers used by runtime.c (device layer only) */
+int  be_n_gpu_layers(void);
+void be_set_cpu_threads(ggml_backend_t cpu_be, int n_threads);
+
 /* ---- loaded model / session --------------------------------------------- */
 struct engine_params {
     const char* path;
