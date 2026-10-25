@@ -56,6 +56,15 @@ static struct ggml_tensor* rope_apply(struct ggml_context* c, struct ggml_tensor
     return ggml_concat(c, o1, o2, 0);                /* [hd, n] */
 }
 
+/* scratch buffer for the per-head attention merge (persistent, sized at load) */
+static struct ggml_tensor* g_merge_scratch   = NULL;   /* [E, max_chunk] F32 */
+static int                 g_merge_scratch_n = 0;
+
+void ph_set_merge_scratch(struct ggml_tensor* t, int max_n) {
+    g_merge_scratch = t;
+    g_merge_scratch_n = max_n;
+}
+
 struct ggml_cgraph* ph_build_graph(struct ggml_context* ctx, const struct ph_hparams* hp,
                                    const struct ph_weights* w, struct ph_kv_cache* kv,
                                    struct ggml_tensor* tokens_in /* [n] i32 */,
@@ -65,6 +74,12 @@ struct ggml_cgraph* ph_build_graph(struct ggml_context* ctx, const struct ph_hpa
     const int HD  = E / NH;
     const int NC  = kv->n_ctx;
     const int nkv_max = pos_begin + n_tokens;   /* keys visible to this step */
+
+    if (g_merge_scratch && n_tokens > g_merge_scratch_n) {
+        phonos_log(PHONOS_LOG_ERROR, "graph: n_tokens %d exceeds merge scratch %d",
+                   n_tokens, g_merge_scratch_n);
+        return NULL;
+    }
 
     struct ggml_cgraph* gf = ggml_new_graph_custom(ctx, GRAPH_SIZE_BUILD, false);
 
@@ -118,8 +133,15 @@ struct ggml_cgraph* ph_build_graph(struct ggml_context* ctx, const struct ph_hpa
             attn_outs[hh] = ggml_mul_mat(ctx, ggml_permute(ctx, vc, 1, 0, 2, 3), p); /* [HD, n] */
         }
 
-        /* merge heads into contiguous [E, n] scratch via copies (correct strides) */
-        struct ggml_tensor* obuf = ggml_new_tensor_2d(ctx, GGML_F32, E, n_tokens);
+        /* merge heads into contiguous [E, n]: persistent scratch tensor when
+         * available (zero-alloc steady state), arena tensor otherwise */
+        struct ggml_tensor* obuf;
+        if (g_merge_scratch) {
+            obuf = ggml_view_2d(ctx, g_merge_scratch, E, n_tokens,
+                                g_merge_scratch->nb[1], 0);
+        } else {
+            obuf = ggml_new_tensor_2d(ctx, GGML_F32, E, n_tokens);
+        }
         for (int hh = 0; hh < NH && hh < 8; hh++) {
             struct ggml_tensor* dst = ggml_view_2d(ctx, obuf, HD, n_tokens, obuf->nb[1],
                                                    (size_t)(hh*HD)*ggml_element_size(obuf));
@@ -150,42 +172,62 @@ struct ggml_cgraph* ph_build_graph(struct ggml_context* ctx, const struct ph_hpa
 }
 
 /* ---- KV cache ------------------------------------------------------------
- * ONE persistent host buffer holds every K/V tensor payload; tensor structs
- * live in a no_alloc ctx. Cache tensors are [n_ctx, HD] (dim0 = keys) so the
- * attention softmax normalizes over dim0 directly — no transposes at read time.
- * Allocated once at load, never reallocated as the sequence grows. */
-int ph_kv_alloc(struct ph_kv_cache* kv, const struct ph_hparams* hp, int n_ctx) {
+ * ONE persistent buffer holds every K/V tensor payload; tensor structs live in
+ * a no_alloc ggml_context. When dev is an accelerator the buffer is device
+ * memory (the scheduler sees it as leaf data and skips H2D copies every step —
+ * PLAN.md rule "minimal host-device transfers"); CPU dev => host buffer.
+ * Cache tensors are [n_ctx, HD] (dim0 = keys) so the attention softmax
+ * normalizes over dim0 directly. Allocated once at load, never reallocated. */
+int ph_kv_alloc(struct ph_kv_cache* kv, const struct ph_hparams* hp, int n_ctx, ggml_backend_dev_t dev) {
     memset(kv, 0, sizeof(*kv));
     const int HD = hp->n_embd / hp->n_head;
     const size_t per   = (size_t)n_ctx * HD * sizeof(float);
     const size_t total = per * 2 * (size_t)hp->n_layers;
 
-    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    if (!cpu_dev) { phonos_log(PHONOS_LOG_ERROR, "kv: no CPU device registered"); return -1; }
-    kv->buf = ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(cpu_dev), total);
+    if (!dev) dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!dev) { phonos_log(PHONOS_LOG_ERROR, "kv: no device registered"); return -1; }
+    kv->buf = ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(dev), total);
     if (!kv->buf) { phonos_log(PHONOS_LOG_ERROR, "kv: buffer alloc (%zu B) failed", total); return -1; }
 
-    char* base = (char*)ggml_backend_buffer_get_base(kv->buf);
-    ggml_backend_buffer_clear(kv->buf, 0, total);      /* zero-fill once */
+    ggml_backend_buffer_clear(kv->buf, 0);             /* zero-fill once */
+    const int host = ggml_backend_buffer_is_host(kv->buf);
 
-    struct ggml_init_params p = { .mem_size = (size_t)hp->n_layers*96 + 4096, .no_alloc = true };
-    kv->ctx = ggml_init(p);
+    /* tensor structs: persistent ctx (host path) or scratch ctx whose structs
+     * are copied into the graph by sched_alloc_graph (device path — standard
+     * llama.cpp pattern for KV cache tensors living in device memory) */
+    const size_t struct_bytes = (size_t)hp->n_layers*96 + 4096;
+    if (host) {
+        struct ggml_init_params p = { .mem_size = struct_bytes, .no_alloc = true };
+        kv->ctx = ggml_init(p);
+    } else {
+        struct ggml_init_params p = { .mem_size = struct_bytes + 128*hp->n_layers, .no_alloc = false };
+        kv->ctx = ggml_init(p);
+    }
     if (!kv->ctx) { phonos_log(PHONOS_LOG_ERROR, "kv: ggml_init failed"); goto bad; }
     kv->k = calloc(hp->n_layers, sizeof(struct ggml_tensor*));
     kv->v = calloc(hp->n_layers, sizeof(struct ggml_tensor*));
     if (!kv->k || !kv->v) goto bad;
+
+    char* base = host ? (char*)ggml_backend_buffer_get_base(kv->buf) : NULL;
 
     for (int L = 0; L < hp->n_layers; L++) {
         char nm[32];
         snprintf(nm, sizeof nm, "kvcache.k%d", L);
         kv->k[L] = ggml_new_tensor_2d(kv->ctx, GGML_F32, n_ctx, HD);     /* [NC, HD] */
         ggml_set_name(kv->k[L], nm);
-        if (ggml_backend_tensor_alloc(kv->buf, kv->k[L], base + (size_t)(2*L)*per) != GGML_STATUS_SUCCESS) goto bad;
 
         snprintf(nm, sizeof nm, "kvcache.v%d", L);
         kv->v[L] = ggml_new_tensor_2d(kv->ctx, GGML_F32, n_ctx, HD);
         ggml_set_name(kv->v[L], nm);
-        if (ggml_backend_tensor_alloc(kv->buf, kv->v[L], base + (size_t)(2*L+1)*per) != GGML_STATUS_SUCCESS) goto bad;
+
+        if (host) {
+            if (ggml_backend_tensor_alloc(kv->buf, kv->k[L], base + (size_t)(2*L)*per) != GGML_STATUS_SUCCESS) goto bad;
+            if (ggml_backend_tensor_alloc(kv->buf, kv->v[L], base + (size_t)(2*L+1)*per) != GGML_STATUS_SUCCESS) goto bad;
+        } else {
+            /* device memory: let the buffer own per-tensor allocations */
+            if (ggml_backend_buffer_init_tensor(kv->buf, kv->k[L]) != GGML_STATUS_SUCCESS) goto bad;
+            if (ggml_backend_buffer_init_tensor(kv->buf, kv->v[L]) != GGML_STATUS_SUCCESS) goto bad;
+        }
     }
     kv->n_ctx = n_ctx;
     kv->cur_len = 0;
@@ -206,13 +248,16 @@ void ph_kv_free(struct ph_kv_cache* kv) {
 void ph_kv_rewind(struct ph_kv_cache* kv, int new_len, int n_layers) {
     if (new_len < 0) new_len = 0;
     if (new_len >= kv->cur_len) { if (new_len > kv->cur_len) kv->cur_len = new_len; return; }
-    const int HD = (int)kv->k[0]->ne[1];
     const size_t row = kv->k[0]->nb[1];                 /* bytes per key row */
-    for (int L = 0; L < n_layers; L++) {
-        memset((char*)kv->k[L]->data + (size_t)new_len*row, 0,
-               (size_t)(kv->cur_len-new_len)*row);
-        memset((char*)kv->v[L]->data + (size_t)new_len*row, 0,
-               (size_t)(kv->cur_len-new_len)*row);
+    const size_t bytes = (size_t)(kv->cur_len-new_len)*row;
+    if (ggml_backend_buffer_is_host(kv->buf)) {
+        for (int L = 0; L < n_layers; L++) {
+            memset((char*)kv->k[L]->data + (size_t)new_len*row, 0, bytes);
+            memset((char*)kv->v[L]->data + (size_t)new_len*row, 0, bytes);
+        }
+    } else {
+        /* device cache rewind: zero the whole persistent buffer (correct, rare op) */
+        ggml_backend_buffer_clear(kv->buf, 0);
     }
     kv->cur_len = new_len;
 }

@@ -111,9 +111,13 @@ struct ggml_cgraph* ph_build_graph(struct ggml_context* ctx, const struct ph_hpa
                                    const struct ph_weights* w, struct ph_kv_cache* kv,
                                    struct ggml_tensor* tokens_in, int n_tokens, int pos_begin,
                                    int logits_last_only);
-int  ph_kv_alloc(struct ph_kv_cache* kv, const struct ph_hparams* hp, int n_ctx);
+int  ph_kv_alloc(struct ph_kv_cache* kv, const struct ph_hparams* hp, int n_ctx, ggml_backend_dev_t dev);
 void ph_kv_free(struct ph_kv_cache* kv);
 void ph_kv_rewind(struct ph_kv_cache* kv, int new_len, int n_layers);
+
+/* persistent attention-merge scratch [E, max_n] F32; NULL reverts to arena alloc */
+struct ggml_tensor;
+void ph_set_merge_scratch(struct ggml_tensor* t, int max_n);
 
 /* ---- tokenizer (tokenizer.c) --------------------------------------------- */
 struct ph_vocab {

@@ -43,6 +43,8 @@ struct engine {
     ggml_backend_sched_t       sched;
     struct ggml_context*       c_build;       /* scratch: graph construction */
     struct ggml_init_params    build_params;
+    struct ggml_context*       c_scratch;     /* persistent merge-scratch tensor struct */
+    ggml_backend_buffer_t      merge_buf;     /* [E, chunk] F32 attention merge scratch */
 
     int   n_ctx;              /* effective window (min(req, train))          */
     int   n_threads;
@@ -116,8 +118,6 @@ struct engine* engine_load(const struct engine_params* p, phonos_status* err) {
 
     e->chunk = (p->chunk > 0 && p->chunk <= DEFAULT_CHUNK) ? p->chunk : DEFAULT_CHUNK;
 
-    if (ph_kv_alloc(&e->kv, &e->hp, e->n_ctx) != 0) { st = PHONOS_ERR_NOMEM; goto fail; }
-
     /* ---- backends + scheduler ------------------------------------------- */
     extern phonos_status be_init(int);
     be_init(p->n_threads_hint);
@@ -134,6 +134,13 @@ struct engine* engine_load(const struct engine_params* p, phonos_status* err) {
     e->sched = ggml_backend_sched_new(bebs, NULL, nb, GRAPH_SIZE, false, true);
     if (!e->sched) { st = PHONOS_ERR_NOMEM; goto fail; }
 
+    /* KV cache lives on the accelerator when available (device memory =>
+     * scheduler treats it as leaf data: no per-step H2D copies). CPU path uses
+     * one persistent host buffer. */
+    if (ph_kv_alloc(&e->kv, &e->hp, e->n_ctx, dev ? dev : NULL) != 0) {
+        st = PHONOS_ERR_NOMEM; goto fail;
+    }
+
     /* graph-construction arena (reset every forward pass) */
     size_t bytes = estimate_step_bytes(&e->hp, e->chunk, e->n_ctx);
     e->build_params = (struct ggml_init_params){ .mem_size = bytes, .no_alloc = false };
@@ -146,6 +153,23 @@ struct engine* engine_load(const struct engine_params* p, phonos_status* err) {
     e->sin_buf  = malloc(sizeof(float) * (size_t)e->chunk * (HD/2));
     e->mask_buf = malloc(sizeof(float) * (size_t)(e->n_ctx + 1) * (size_t)e->chunk);
     if (!e->tok_buf || !e->cos_buf || !e->sin_buf || !e->mask_buf) { st = PHONOS_ERR_NOMEM; goto fail; }
+
+    /* persistent attention-merge scratch [E, chunk] F32 in a dedicated ctx so
+     * its struct survives ggml_reset of the build arena (zero-alloc decode) */
+    {
+        struct ggml_init_params sp = { .mem_size = 4096, .no_alloc = false };
+        e->c_scratch = ggml_init(sp);
+        if (!e->c_scratch) { st = PHONOS_ERR_NOMEM; goto fail; }
+        struct ggml_tensor* m = ggml_new_tensor_2d(e->c_scratch, GGML_F32, e->hp.n_embd, e->chunk);
+        ggml_set_name(m, "attn.merge");
+        ggml_backend_buffer_t mb = ggml_backend_alloc_buffer(e->be_cpu, ggml_nbytes(m));
+        if (!mb) { st = PHONOS_ERR_NOMEM; goto fail; }
+        if (ggml_backend_tensor_alloc(mb, m, ggml_backend_buffer_get_base(mb)) != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(mb); st = PHONOS_ERR_NOMEM; goto fail;
+        }
+        e->merge_buf = mb;
+        ph_set_merge_scratch(m, e->chunk);
+    }
 
     e->n_threads = engine_n_threads_impl();
     be_set_cpu_threads(e->be_cpu, e->n_threads);
@@ -163,7 +187,10 @@ fail:
 
 void engine_free(struct engine* e) {
     if (!e) return;
+    ph_set_merge_scratch(NULL, 0);
     free(e->tok_buf); free(e->cos_buf); free(e->sin_buf); free(e->mask_buf);
+    if (e->merge_buf) ggml_backend_buffer_free(e->merge_buf);
+    if (e->c_scratch) ggml_free(e->c_scratch);
     if (e->sched) ggml_backend_sched_free(e->sched);
     if (e->c_build) ggml_free(e->c_build);
     if (e->be_accel) ggml_backend_free(e->be_accel);

@@ -55,6 +55,9 @@ def w_kv(f, key, kind, value):
                 w_str(f, it)
             else:
                 w_scalar(f, elem_kind, it)
+    elif kind == STR:
+        f.write(struct.pack("<I", STR))
+        w_str(f, value)
     else:
         f.write(struct.pack("<I", kind))
         w_scalar(f, kind, value)
