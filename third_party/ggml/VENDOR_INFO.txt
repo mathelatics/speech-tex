@@ -1,0 +1,1 @@
+da8e2a5 (master, 2026-10) https://github.com/ggml-org/ggml — vendored verbatim except ci/, docs/, examples/, tests/ removed. MIT LICENSE retained.
